@@ -649,7 +649,7 @@ Nothing here ever invents an address. Every failure yields an empty
 Before: slack 18 documents, **0 with an actor**, `metadata {}`, `timestamp 0.0`
 on all of them. Gmail 8 documents, 8 with an actor.
 
-After: slack 18/18 with `actor_email 'abhijandyala@gmail.com'`, `actor_id
+After: slack 18/18 with `actor_email '<workspace-owner-address>'`, `actor_id
 'U0BL91BSTDL'`, real timestamps, full connector metadata. Gmail unchanged at
 8/8 with the same five addresses and the same timestamps — the old shape still
 works.
@@ -670,12 +670,12 @@ author is a bot or app, which has no address").
 
 **Left undone / for others:**
 
-- **The Slack messages resolve to `abhijandyala@gmail.com`, and the memory seed
+- **The Slack messages resolve to `<workspace-owner-address>`, and the memory seed
   fixture is keyed on `ops@northbeam.io`.** Proven directly: `memory_read` for
   `ops@northbeam.io` reads back `times_reported_by_actor 2`, and for
-  `abhijandyala@gmail.com` reads back `0`. Both answers are honest; they are
+  `<workspace-owner-address>` reads back `0`. Both answers are honest; they are
   about different people. Re-key `fixtures/` (A5's seed) to
-  `abhijandyala@gmail.com` and the Slack complaint becomes contact 3.
+  `<workspace-owner-address>` and the Slack complaint becomes contact 3.
 - The tenant holds each Slack message **twice** — 9 connector-synced documents
   and 9 hand-ingested duplicates of the same channel, which is why the count is
   18 for 9 messages. The hand-ingested copies put the member id in the generic

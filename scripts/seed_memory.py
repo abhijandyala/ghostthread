@@ -349,8 +349,13 @@ def main() -> int:
         return 2
     topics = load_topics(path, actor_override=args.actor)
     episodes = [e for t in topics for e in t.episodes]
-    print(f"{path.relative_to(ROOT) if path.is_absolute() else path}: "
-          f"{len(episodes)} episode(s) across {len(topics)} topic(s)")
+    # relative_to raises when the fixture lives outside the repo, which is a
+    # legitimate thing to pass on the command line.
+    try:
+        shown = path.relative_to(ROOT)
+    except ValueError:
+        shown = path
+    print(f"{shown}: {len(episodes)} episode(s) across {len(topics)} topic(s)")
 
     live = resolve_mode(args)
     if live is None:

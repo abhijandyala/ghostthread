@@ -74,9 +74,17 @@ counts, just prior resolutions that genuinely happened.
 > .venv/bin/python scripts/seed_memory.py --force --actor you@second-account.com
 > ```
 >
-> For reference, measured against the live tenant: a Slack message posted from
-> this workspace resolves to `abhijandyala@gmail.com`, and the fixture default is
-> `ops@northbeam.io`, which matches neither. Pick one and be consistent.
+> A Slack message resolves to the posting member's workspace address, which is
+> not the fixture default of `ops@northbeam.io` — so a Slack-delivered contact 3
+> needs `--actor` set to whatever that address is. To see what a given source
+> actually resolves to:
+>
+> ```bash
+> PYTHONPATH=src .venv/bin/python -c "
+> from ghostthread import knowledge_query as kq
+> for d in kq.load_documents('slack', refresh=True)[:3]:
+>     print(d.actor_email or '(none)', '|', d.text[:50])"
+> ```
 
 Contact 3 is the message you post live. When it lands, GhostThread should report
 `times_reported_by_actor: 3`, tone `escalation`, and name the two prior tickets.
