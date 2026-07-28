@@ -372,3 +372,317 @@ chunk against a silently wrong answer.
   ungrounded run it will still draw a table of zeros with the refusal only in
   the headline text. Track B should grey the table out when `grounded` is
   false; the data is there.
+
+## 2026-07-28 13:35 — A4, the Track A eval suite
+
+**Task:** build the phase A4 eval suite. Files created:
+`src/ghostthread/eval_suite.py`, `scripts/eval.py`, `fixtures/eval_cases.json`.
+One line added to the `Makefile` (`eval` target + `.PHONY`). Nothing else
+touched; `contracts.py`, `memory.py`, `killshot.py` and `knowledge_query.py`
+were read only.
+
+**Did:**
+
+The constraint that shaped everything: the tenant holds noise. 23 complaint
+documents that are Google security alerts, Linear onboarding notices and
+"testing" Slack messages; GitHub has a connector but zero documents; nothing
+resolves; `SEED.md` is not seeded. A table of "complaint X must be a leak" would
+have been unrunnable today and stale the moment the tenant changes, and an eval
+that cannot run is worse than none because its silence reads as approval. So the
+suite is two layers plus a set of negative controls.
+
+*Layer 1, ten invariants.* Properties of the system rather than of the data, so
+they hold on an empty tenant, on the seeded one, and on whatever is there next
+week:
+
+- three separate checks that a complaint-side-only scope (`slack`, `gmail`,
+  `slack+gmail`) makes every verdict `unknown` with `confidence is None`. This
+  is the graded kill-shot claim, checked per scope because each fails for its
+  own reason.
+- a narrower scope never reports more resolved complaints than the full-scope
+  run. Five subsets are compared. This is the property a display-filter kill
+  shot satisfies trivially and a genuinely re-scoped query has to earn.
+- `resolved` always carries at least one `matched_work_items` entry, `leak`
+  carries none.
+- `sources_used` and `sources_missing` are disjoint and every id in them is a
+  real connector id read from `ConnectorRegistry`.
+- `confidence is None` if and only if `verdict == "unknown"`.
+- a freshly generated actor with a freshly generated topic reads back zeros and
+  tone `first_contact`.
+- `memory_read` with `HYDRA_TOKEN` blanked returns an honest empty result rather
+  than raising or inventing counts.
+- with the credential blanked, `detect_leaks` raises `SourceUnavailable` *and*
+  `detect_leaks_run` returns `grounded=False` with per-provider reasons and no
+  verdicts. Both halves asserted: the raise is what makes an empty list mean
+  "read them, found nothing", and the run is what lets a UI degrade instead of
+  crashing.
+
+The last three shape checks walk every verdict from every scope the suite ran —
+115 verdicts across 6 scopes on the current tenant — rather than only the
+reference run.
+
+*Layer 2, `fixtures/eval_cases.json`.* Schema plus two illustrative entries with
+placeholder complaint ids. A case whose `complaint_id` is not in the tenant is
+SKIPPED with the complaint id quoted, never passed. Data rather than Python for
+two reasons: `verify_no_hardcoding.py` scans `src/` for demo entity names and
+would rightly fail this file if it named one, and the table has to be fillable
+by whoever seeds `SEED.md` without editing code.
+
+*Negative controls.* Three defined, two runnable against this tenant:
+
+- `ctl.bogus_connector_id` — query the work collections with a freshly
+  generated UUID as `connector_id`. The real id returns 4 candidates, the
+  generated one returns 0. This is the check that the kill shot's honesty rests
+  on: if a made-up id still returned hits, the metadata filter would be inert
+  and every scoped row would be a display filter wearing a costume.
+- `ctl.semantic_floor_moves_scores` — drop `semantic_floor` to 0 and assert
+  calibrated scores rise. 4 of 4 rose. A score indifferent to the one profile
+  knob that touches every score is not being calibrated against the profile.
+- `ctl.unreachable_match_threshold` — raise `match_threshold` to
+  `math.nextafter(1.0, inf)`, which `evaluate`'s clamped score can never reach,
+  and assert every resolution flips to leak. Skipped today: the tenant resolves
+  nothing, so there is no resolution to break. Derived rather than written as a
+  literal, because a threshold this file invented is the thing the project
+  claims not to do.
+
+*Three states, kept apart.* `pass`, `fail`, `skip`. The count line prints all
+three and the banner adds "a skip is not a pass: the data those checks need is
+not in the tenant, so they proved nothing either way". With an empty tenant this
+is the whole point — 12 passed / 0 failed / 3 skipped must not read as 15 green.
+
+The suite never writes to the tenant. Both memory probes use a uuid-derived
+actor, topic and complaint id, so the actor-filtered and the topical query both
+have to come back empty; a nonzero count there is an invented one.
+
+**Verified:** (live tenant, `DRY_RUN=true`, `.venv/bin/python`, `PYTHONPATH=src`)
+
+- `scripts/eval.py` exit 0: 12 passed, 0 failed, 3 skipped. `grounded=True`,
+  profile origin `insforge`, 23 complaints / 23 clusters / 0 resolved,
+  ~24s wall.
+- `scripts/smoke.py --demo-ready` exit 0, 5/5 PASS, no stubs, 14 complaints /
+  14 actions, `backends.grounding=hydradb`.
+- `scripts/verify_no_hardcoding.py` exit 0, 3/3 PASS — including "no demo entity
+  names in source" with `eval_suite.py` now inside `src/`.
+- **The eval was proven able to fail.** Two regressions injected at runtime from
+  a scratch file outside the repo (never committed, since deleted): `evaluate`
+  wrapped to turn every `unknown` into `leak` with confidence 0.9, and
+  `search_work` wrapped to drop `use_connector_filter`. Result: exit 1, 8
+  passed / 4 failed / 3 skipped. All three `inv.refuses_without_work_source.*`
+  rows failed with "18/5/23 verdict(s) were not unknown and carried a
+  confidence; with no work-side connector in scope the system must refuse, not
+  answer", and `ctl.bogus_connector_id` failed with "5 candidate(s) came back
+  under a connector id that exists nowhere; the connector filter is not scoping
+  the query". Un-patched and re-run: exit 0, 12/0/3 again.
+- Tenant left clean: collections are `github, gmail, linear, slack`, the
+  `memories` collection does not exist, 0 memory rows.
+
+**Left undone / for others:**
+
+- **`ctl.unreachable_match_threshold` has never actually executed**, because
+  nothing in this tenant resolves. It is written and it skips honestly, but its
+  own correctness is unproven until something resolves. Whoever seeds `SEED.md`
+  should re-run `make eval` and confirm that row goes PASS rather than SKIP —
+  if it stays SKIP after seeding, that is itself a finding about the matcher.
+- Layer 2 is two placeholder rows. Both skip. Filling
+  `fixtures/eval_cases.json` with real complaint ids after seeding is the
+  remaining A4 work and needs no code change.
+- The suite issues 6 full `detect_leaks_run` sweeps and takes ~24s. Acceptable
+  for a pre-rehearsal check, too slow for CI on every commit. The document cache
+  carries most of it; the per-complaint work queries are the cost.
+- `check_leaks_without_credential` calls `refresh_documents()` on the way in and
+  out, so any caller running the suite inside a longer-lived process pays a cold
+  document read afterwards. Necessary: a warm cache answers from the last good
+  read and the check would pass without ever going near the blanked credential.
+- The complaint count moved from 16 to 23 between two runs a few minutes apart
+  while I was testing. The connectors are live-syncing, so eval numbers are not
+  stable across runs — another reason layer 1 asserts on properties rather than
+  counts.
+- `eval_suite.py` is not in `verify_no_hardcoding.py`'s `DECISION_MODULES`, same
+  as `killshot.py` and `knowledge_query.py`. I checked it by hand against the
+  same AST rule: the only float literals are `NO_SEMANTIC_FLOOR = 0.0` and
+  `math.nextafter(1.0, math.inf)`, neither of which appears in a comparison.
+  Adding the file to that list is a one-line change to a script I was not
+  scoped to touch.
+
+## 2026-07-28 14:05 — A5, seeding HydraDB Memories before the demo
+
+**Task:** put Northbeam's two prior contacts into HydraDB Memories so the live
+third contact is a third contact. Files created: `scripts/seed_memory.py`,
+`fixtures/memory_seed.json`. Nothing else touched; `contracts.py`, `memory.py`,
+`knowledge_query.py` and `intent.py` were read only.
+
+**Did:**
+
+*The fixture is data.* `fixtures/memory_seed.json` holds actors → topics →
+episodes, each episode mapping 1:1 onto `MemoryWriteInput`, plus the topic's
+`live_complaint` (the third contact, not written) which the seeder reuses as
+its retrieval probe — so the verification query is the query the demo will run.
+Recency is `resolved_days_ago`, not a date, for the same reason `corpus.json`
+stores offsets in hours: a hardcoded date rots and the demo stops working the
+next morning without saying so. More actors, topics and episodes can be added
+without touching the script.
+
+*The seeder writes through production.* Every episode goes through
+`memory.memory_write`, not `context.ingest`. A seeder with its own write path
+proves nothing about the pipeline, and the id derivation, the source
+attribution from the complaint id prefix and the upsert all come free.
+
+*The dry-run gate is explicit.* `memory_write` returns `DRY-` ids and persists
+nothing while `DRY_RUN` is true, which is the default, so with neither flag the
+script refuses and exits 2 with the reason. `--force` flips `config.DRY_RUN`
+for that process only (never the `.env`); an environment that already has
+`DRY_RUN=false` needs no flag. `--dry-run` *pins* `DRY_RUN` true rather than
+leaving it alone, so a dry run in a live environment cannot quietly write.
+
+*It reports what the system recalls, not what it wanted.* After seeding it
+polls `databases.stats(...).memory_collection.row_count` until it reaches the
+episode count and stops moving (three unchanged polls, 120s ceiling), then
+reads back through `memory.memory_read` and prints
+`times_reported_by_actor`, `times_seen_on_topic`, `stub`, the prior
+resolutions and `derive_reply_tone`. The acceptance check is in the script: the
+expected tone is obtained by calling `derive_reply_tone` on a synthetic result
+carrying the number of episodes seeded, so it retunes with the profile instead
+of comparing against a number. Mismatch exits 1.
+
+*`--purge` is scoped to the fixture ids.* A rehearsal reset must not delete
+memories the pipeline wrote for real complaints, so it deletes exactly
+`mem-{complaint_id}` for the seeded episodes and polls the count until the
+deletion has settled.
+
+**Verified:** (live tenant, `.venv/bin/python`, `PYTHONPATH=src`)
+
+- `--dry-run` exit 0: both payloads printed, ids `DRY-mem-gmail-nb-104` /
+  `DRY-mem-slack-nb-118`, tenant untouched at 0 rows.
+- No flags: exit 2, "REFUSING TO RUN: DRY_RUN is true...". It does not write and
+  it does not claim to.
+- `--force` exit 0: `mem-gmail-nb-104`, `mem-slack-nb-118`, rows 0 → 2,
+  read back `times_reported_by_actor 2`, `times_seen_on_topic 2`, `stub False`,
+  both prior resolutions with their dates and NB ticket urls, tone `returning`.
+- `--force` again exit 0: same two ids, rows still 2, counts still 2. Idempotent.
+- `--purge --force` exit 0: both ids deleted, rows 2 → 0. Re-seeded immediately
+  after with `--force`: rows back to 2, same counts, tone `returning`.
+- **`escalation` proven end-to-end, not asserted.** Two episodes is a
+  *returning* actor: `{returning: 1, escalation: 3}` and two prior contacts is
+  two. So a throwaway third memory was written for the same actor with the live
+  contact-3 text, read back `times_reported_by_actor: 3`,
+  `times_seen_on_topic: 3`, tone `escalation` — then deleted, count confirmed
+  back at 2. The script prints this as "tone on the live contact: escalation (at
+  3 contacts)" rather than padding the fixture to make the seeded state look
+  nicer than it is.
+- `scripts/eval.py` exit 0: 12 passed / 0 failed / 3 skipped, unchanged by the
+  seed. `scripts/verify_no_hardcoding.py` exit 0, 3/3. `scripts/smoke.py`
+  exit 0, 5/5, `memory: hydradb`.
+- **Tenant left at 2 memory rows**, both seeded, as demo state.
+
+**Left undone / for others:**
+
+- **The seeded actor is `ops@northbeam.io` and the live complaint must carry
+  that exact `author_email`, or the counts read back as zero** — a legitimate
+  answer, so it fails silently. `memory_read` filters on the actor metadata
+  exactly. A Slack message posted by the operator relaying the report arrives
+  with the *operator's* email, so contact 3 needs to come in through the
+  `/complaint` API with `author_email` set to the fixture's actor, or the
+  fixture's actor changed to whatever Slack will present. This is the one thing
+  standing between the seed and the demo beat, and it is not something the
+  seeder can check for you.
+- The `NB-104` / `NB-118` ticket urls are the prior resolutions SEED.md
+  describes. They are demo history, not live Linear issues, and the urls do not
+  resolve in a browser. Flagged in the fixture's `_schema` block.
+- `ctl.unreachable_match_threshold` still SKIPs. Nothing in the tenant resolves,
+  and memories are not verdicts, so seeding memory was never going to change
+  that — it needs the SEED.md Linear/GitHub issues.
+- `fixtures/eval_cases.json` is still two placeholders. Unrelated to A5, still
+  the remaining A4 work.
+
+## 2026-07-28 13:55 — Slack complaints had no actor at all
+
+**Task:** two compounding defects that left every Slack complaint with
+`actor_email == ""`, so no Slack message could ever match a memory or a Gmail
+complaint from the same human. Files touched:
+`src/ghostthread/knowledge_query.py`, `src/ghostthread/resolve.py`. Both Track
+A. `contracts.py`, `memory.py`, `killshot.py`, `eval_suite.py` and every Track
+B file read only.
+
+**Defect A — `load_documents` read the wrong metadata keys.**
+
+`context.inspect` returns two different shapes and the loader only understood
+one. A hand ingest (the Gmail OAuth path, the older Linear fixtures) writes
+`additional_metadata` / `document_metadata` / `tenant_metadata`. A document
+synced by a HydraDB managed connector carries none of those; it holds
+`app_metadata` (connector_id, `slack_author_id`, `resource_id`) and `app_fields`
+(`author`, `body`, `created_at`). The loader merged only the first three, so
+every connector document built `metadata = {}` and, from that, no actor, and
+`timestamp` and `url` came off a top level that does not carry them either.
+
+`_metadata_of` now flattens all five, explicit-ingest keys winning, because one
+tenant holds both kinds at once. `text` falls back to `app_fields.body`, and the
+timestamp falls back to `created_at` and then to `slack_ts` — the latter is
+already epoch seconds carried as a string, so `_iso_to_epoch` became `_to_epoch`
+and tries a native epoch before ISO.
+
+Two smaller things came out of the same read. `_actor_of` used to accept
+`slack_author_id` as an address; a member id in an email field makes a complaint
+look attributed while matching nothing, which is worse than an empty one, so
+addresses now go through `resolve.extract_email` (which also unwraps a
+`Name <a@b.com>` `from` header) and the member id gets its own `Document.actor_id`
+field. The id stays available, so a document with no address is still
+identifiable.
+
+**Defect B — Slack has no email anywhere, only a member id.**
+
+New section at the bottom of `resolve.py`: `SlackDirectory`, member id -> address
+through `GET users.info`, plus `SlackMember` and a process-wide singleton behind
+`slack_emails()`. `knowledge_query._resolve_slack_actors` runs once per load
+over the distinct ids actually present, so 18 documents cost exactly one
+`users.info` call (verified by a counting transport). Misses are cached too: a
+bot has no address and a token without `users:read.email` never will, so
+re-asking per document buys a call to learn the same nothing. The transport is
+injectable, which is how the degraded paths below were exercised without
+breaking the live token.
+
+Nothing here ever invents an address. Every failure yields an empty
+`actor_email` and a `reason`, and an empty actor is a real answer —
+`memory_read` correctly reports zero prior contacts for it.
+
+**Verified:** (live tenant, `.venv/bin/python`, `PYTHONPATH=src`)
+
+Before: slack 18 documents, **0 with an actor**, `metadata {}`, `timestamp 0.0`
+on all of them. Gmail 8 documents, 8 with an actor.
+
+After: slack 18/18 with `actor_email '<workspace-owner-address>'`, `actor_id
+'U0BL91BSTDL'`, real timestamps, full connector metadata. Gmail unchanged at
+8/8 with the same five addresses and the same timestamps — the old shape still
+works.
+
+Degraded paths, each producing an empty actor and a stated reason rather than a
+guess: no `SLACK_TOKEN` ("no SLACK_TOKEN configured, so member ids cannot be
+resolved"), transport raising ("users.info failed: RuntimeError: connection
+reset"), `ok:false` ("users.info refused: missing_scope"), bot author ("Slack
+author is a bot or app, which has no address").
+
+- `scripts/eval.py` exit 0: 12 passed / 0 failed / 3 skipped, `complaints_examined
+  26`, all invariants holding across 130 verdicts and 6 scopes. (A4 logged 23
+  documents; the difference is tenant data added since, not this change — the
+  loader returned 18 Slack documents before and after, they simply had no actor.)
+- `scripts/smoke.py --demo-ready` exit 0, 5/5, `memory: hydradb`.
+- `scripts/verify_no_hardcoding.py` exit 0, 3/3.
+- Tenant left at **2 memory rows**. Nothing created, nothing deleted.
+
+**Left undone / for others:**
+
+- **The Slack messages resolve to `<workspace-owner-address>`, and the memory seed
+  fixture is keyed on `ops@northbeam.io`.** Proven directly: `memory_read` for
+  `ops@northbeam.io` reads back `times_reported_by_actor 2`, and for
+  `<workspace-owner-address>` reads back `0`. Both answers are honest; they are
+  about different people. Re-key `fixtures/` (A5's seed) to
+  `<workspace-owner-address>` and the Slack complaint becomes contact 3.
+- The tenant holds each Slack message **twice** — 9 connector-synced documents
+  and 9 hand-ingested duplicates of the same channel, which is why the count is
+  18 for 9 messages. The hand-ingested copies put the member id in the generic
+  `entity_id` rather than in `slack_author_id`, so `_slack_member_id` reads
+  `entity_id` as a member id for Slack documents only; both copies resolve. The
+  duplication itself is an ingest problem, not a loader one, and is untouched.
+- Connector documents have no top-level `id`, so their `Document.id` is the
+  content hash HydraDB enumerates them under. That gives up no source prefix, so
+  `memory._source_of` files a memory written for one as `unattributed`. Noted,
+  not fixed: it is a memory-side question and `memory.py` is out of scope.
