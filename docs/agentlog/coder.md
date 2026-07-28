@@ -503,3 +503,93 @@ have to come back empty; a nonzero count there is an invented one.
   `math.nextafter(1.0, math.inf)`, neither of which appears in a comparison.
   Adding the file to that list is a one-line change to a script I was not
   scoped to touch.
+
+## 2026-07-28 14:05 — A5, seeding HydraDB Memories before the demo
+
+**Task:** put Northbeam's two prior contacts into HydraDB Memories so the live
+third contact is a third contact. Files created: `scripts/seed_memory.py`,
+`fixtures/memory_seed.json`. Nothing else touched; `contracts.py`, `memory.py`,
+`knowledge_query.py` and `intent.py` were read only.
+
+**Did:**
+
+*The fixture is data.* `fixtures/memory_seed.json` holds actors → topics →
+episodes, each episode mapping 1:1 onto `MemoryWriteInput`, plus the topic's
+`live_complaint` (the third contact, not written) which the seeder reuses as
+its retrieval probe — so the verification query is the query the demo will run.
+Recency is `resolved_days_ago`, not a date, for the same reason `corpus.json`
+stores offsets in hours: a hardcoded date rots and the demo stops working the
+next morning without saying so. More actors, topics and episodes can be added
+without touching the script.
+
+*The seeder writes through production.* Every episode goes through
+`memory.memory_write`, not `context.ingest`. A seeder with its own write path
+proves nothing about the pipeline, and the id derivation, the source
+attribution from the complaint id prefix and the upsert all come free.
+
+*The dry-run gate is explicit.* `memory_write` returns `DRY-` ids and persists
+nothing while `DRY_RUN` is true, which is the default, so with neither flag the
+script refuses and exits 2 with the reason. `--force` flips `config.DRY_RUN`
+for that process only (never the `.env`); an environment that already has
+`DRY_RUN=false` needs no flag. `--dry-run` *pins* `DRY_RUN` true rather than
+leaving it alone, so a dry run in a live environment cannot quietly write.
+
+*It reports what the system recalls, not what it wanted.* After seeding it
+polls `databases.stats(...).memory_collection.row_count` until it reaches the
+episode count and stops moving (three unchanged polls, 120s ceiling), then
+reads back through `memory.memory_read` and prints
+`times_reported_by_actor`, `times_seen_on_topic`, `stub`, the prior
+resolutions and `derive_reply_tone`. The acceptance check is in the script: the
+expected tone is obtained by calling `derive_reply_tone` on a synthetic result
+carrying the number of episodes seeded, so it retunes with the profile instead
+of comparing against a number. Mismatch exits 1.
+
+*`--purge` is scoped to the fixture ids.* A rehearsal reset must not delete
+memories the pipeline wrote for real complaints, so it deletes exactly
+`mem-{complaint_id}` for the seeded episodes and polls the count until the
+deletion has settled.
+
+**Verified:** (live tenant, `.venv/bin/python`, `PYTHONPATH=src`)
+
+- `--dry-run` exit 0: both payloads printed, ids `DRY-mem-gmail-nb-104` /
+  `DRY-mem-slack-nb-118`, tenant untouched at 0 rows.
+- No flags: exit 2, "REFUSING TO RUN: DRY_RUN is true...". It does not write and
+  it does not claim to.
+- `--force` exit 0: `mem-gmail-nb-104`, `mem-slack-nb-118`, rows 0 → 2,
+  read back `times_reported_by_actor 2`, `times_seen_on_topic 2`, `stub False`,
+  both prior resolutions with their dates and NB ticket urls, tone `returning`.
+- `--force` again exit 0: same two ids, rows still 2, counts still 2. Idempotent.
+- `--purge --force` exit 0: both ids deleted, rows 2 → 0. Re-seeded immediately
+  after with `--force`: rows back to 2, same counts, tone `returning`.
+- **`escalation` proven end-to-end, not asserted.** Two episodes is a
+  *returning* actor: `{returning: 1, escalation: 3}` and two prior contacts is
+  two. So a throwaway third memory was written for the same actor with the live
+  contact-3 text, read back `times_reported_by_actor: 3`,
+  `times_seen_on_topic: 3`, tone `escalation` — then deleted, count confirmed
+  back at 2. The script prints this as "tone on the live contact: escalation (at
+  3 contacts)" rather than padding the fixture to make the seeded state look
+  nicer than it is.
+- `scripts/eval.py` exit 0: 12 passed / 0 failed / 3 skipped, unchanged by the
+  seed. `scripts/verify_no_hardcoding.py` exit 0, 3/3. `scripts/smoke.py`
+  exit 0, 5/5, `memory: hydradb`.
+- **Tenant left at 2 memory rows**, both seeded, as demo state.
+
+**Left undone / for others:**
+
+- **The seeded actor is `ops@northbeam.io` and the live complaint must carry
+  that exact `author_email`, or the counts read back as zero** — a legitimate
+  answer, so it fails silently. `memory_read` filters on the actor metadata
+  exactly. A Slack message posted by the operator relaying the report arrives
+  with the *operator's* email, so contact 3 needs to come in through the
+  `/complaint` API with `author_email` set to the fixture's actor, or the
+  fixture's actor changed to whatever Slack will present. This is the one thing
+  standing between the seed and the demo beat, and it is not something the
+  seeder can check for you.
+- The `NB-104` / `NB-118` ticket urls are the prior resolutions SEED.md
+  describes. They are demo history, not live Linear issues, and the urls do not
+  resolve in a browser. Flagged in the fixture's `_schema` block.
+- `ctl.unreachable_match_threshold` still SKIPs. Nothing in the tenant resolves,
+  and memories are not verdicts, so seeding memory was never going to change
+  that — it needs the SEED.md Linear/GitHub issues.
+- `fixtures/eval_cases.json` is still two placeholders. Unrelated to A5, still
+  the remaining A4 work.

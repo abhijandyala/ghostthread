@@ -1,7 +1,15 @@
 # TestTeam seed content
 
-Paste this in as-is. The content is engineered so the kill shot produces a clean,
-monotone degradation *with false leaks*, which is the part judges react to.
+Paste this in as-is. The content is engineered for two things at once: a kill
+shot that degrades cleanly *with false leaks*, and a repeat complainant whose
+history makes the memory pitch visible.
+
+> **Revised for the memory-first pitch.** The first version had one complaint per
+> topic per actor, which is fine for leak detection and useless for memory —
+> `times_reported_by_actor` would be 1 for everyone and every reply would come
+> out `first_contact`. Since the lede is now "every other agent reads one
+> message, we read the history", the seed needs someone with a history. Section 0
+> is the addition; everything else is unchanged.
 
 **TestTeam** is a B2B SaaS dashboard that rolls up sprint progress across projects.
 Its three advertised features — cross-project rollups, one-click CSV/Excel export,
@@ -33,6 +41,52 @@ Expected degradation:
 | slack + linear | 4 | 2 | 3 |
 | slack + gmail + linear | 7 | 2 | 0 |
 | all four | **5** | **0** | **0** |
+
+---
+
+## 0. The repeat actor — this is what makes the memory beat work
+
+One customer, **Northbeam**, reports the same defect three times over five weeks.
+`reply_tone_thresholds` in the intent profile is `{returning: 1, escalation: 3}`,
+so the third contact must land on `escalation` — and it only does if the first
+two are in HydraDB Memories before the demo starts.
+
+| # | when | channel | state |
+|---|---|---|---|
+| 1 | ~5 weeks ago | Gmail | resolved, ticket closed |
+| 2 | ~3 weeks ago | Slack | resolved, ticket closed — "fixed" but it regressed |
+| 3 | during the demo | Slack | the live complaint |
+
+Contacts 1 and 2 go into **memory**, not into the connectors, because they are
+history rather than open work. `scripts/seed_memory.py` writes them through the
+same `memory_write` path the pipeline uses — no special-casing, no fabricated
+counts, just prior resolutions that genuinely happened.
+
+Contact 3 is the message you post live. When it lands, GhostThread should report
+`times_reported_by_actor: 3`, tone `escalation`, and name the two prior tickets.
+
+**Contact 1 — Gmail, ~5 weeks ago.** Subject: `CSV export truncating rows`
+> Our Friday export came out short again — 1,204 rows in the file against 1,231 on the dashboard. No error, the file just ends. We reconcile these against finance so the gap gets noticed.
+
+Resolution: closed as `NB-104`, "export pagination dropped the final partial page".
+
+**Contact 2 — Slack, ~3 weeks ago, `#all-testteam`.**
+> Northbeam again on the CSV export — it's short by a handful of rows. This is the same thing we closed a couple of weeks back, it's come back.
+
+Resolution: closed as `NB-118`, "reopened, off-by-one in the page-boundary fix".
+
+**Contact 3 — post this live during the demo.**
+> Northbeam, third time on this: the CSV export is still dropping rows. We were told twice this was fixed. 8,400 contacts exported, 212 missing, every one with a non-ASCII character in the name. We need someone senior on this.
+
+That third message is deliberately the same defect described more precisely, so
+retrieval matches it to the prior two on topic while the escalating tone is
+carried by the counts rather than by the wording.
+
+**Why seed memory rather than post all three as complaints:** contacts 1 and 2
+were *resolved*. If they were live complaints in Slack and Gmail they would be
+two more rows in the leak table competing for attention, and the demo would have
+to explain why they are not leaks. As memories they are what they actually are —
+history — and they make the third contact mean something.
 
 ---
 
@@ -140,6 +194,18 @@ well under the auto-fix ceiling in the intent profile. Don't fix it beforehand.
 ```bash
 .venv/bin/python scripts/setup_connectors.py --only slack,linear,github
 .venv/bin/python scripts/ingest_gmail.py
+.venv/bin/python scripts/seed_memory.py          # Northbeam's two prior contacts
+.venv/bin/python scripts/eval.py                 # should go green, with fewer skips
 ```
 
 Slack and Linear sync in seconds. Give GitHub a moment after creating the issues.
+
+Then fill in `fixtures/eval_cases.json` with the real complaint ids and their
+expected verdicts. Until that happens the expected-case checks skip rather than
+pass, and a skip proves nothing.
+
+**The check that matters before you go on stage:** run the memory read for
+Northbeam and confirm `times_reported_by_actor` is 3 and the tone is
+`escalation`. If it says `first_contact`, the memory seed did not land and the
+central beat of the pitch is dead — with no visible error, because zero prior
+contacts is a legitimate answer.
