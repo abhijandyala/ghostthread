@@ -593,3 +593,96 @@ deletion has settled.
   that — it needs the SEED.md Linear/GitHub issues.
 - `fixtures/eval_cases.json` is still two placeholders. Unrelated to A5, still
   the remaining A4 work.
+
+## 2026-07-28 13:55 — Slack complaints had no actor at all
+
+**Task:** two compounding defects that left every Slack complaint with
+`actor_email == ""`, so no Slack message could ever match a memory or a Gmail
+complaint from the same human. Files touched:
+`src/ghostthread/knowledge_query.py`, `src/ghostthread/resolve.py`. Both Track
+A. `contracts.py`, `memory.py`, `killshot.py`, `eval_suite.py` and every Track
+B file read only.
+
+**Defect A — `load_documents` read the wrong metadata keys.**
+
+`context.inspect` returns two different shapes and the loader only understood
+one. A hand ingest (the Gmail OAuth path, the older Linear fixtures) writes
+`additional_metadata` / `document_metadata` / `tenant_metadata`. A document
+synced by a HydraDB managed connector carries none of those; it holds
+`app_metadata` (connector_id, `slack_author_id`, `resource_id`) and `app_fields`
+(`author`, `body`, `created_at`). The loader merged only the first three, so
+every connector document built `metadata = {}` and, from that, no actor, and
+`timestamp` and `url` came off a top level that does not carry them either.
+
+`_metadata_of` now flattens all five, explicit-ingest keys winning, because one
+tenant holds both kinds at once. `text` falls back to `app_fields.body`, and the
+timestamp falls back to `created_at` and then to `slack_ts` — the latter is
+already epoch seconds carried as a string, so `_iso_to_epoch` became `_to_epoch`
+and tries a native epoch before ISO.
+
+Two smaller things came out of the same read. `_actor_of` used to accept
+`slack_author_id` as an address; a member id in an email field makes a complaint
+look attributed while matching nothing, which is worse than an empty one, so
+addresses now go through `resolve.extract_email` (which also unwraps a
+`Name <a@b.com>` `from` header) and the member id gets its own `Document.actor_id`
+field. The id stays available, so a document with no address is still
+identifiable.
+
+**Defect B — Slack has no email anywhere, only a member id.**
+
+New section at the bottom of `resolve.py`: `SlackDirectory`, member id -> address
+through `GET users.info`, plus `SlackMember` and a process-wide singleton behind
+`slack_emails()`. `knowledge_query._resolve_slack_actors` runs once per load
+over the distinct ids actually present, so 18 documents cost exactly one
+`users.info` call (verified by a counting transport). Misses are cached too: a
+bot has no address and a token without `users:read.email` never will, so
+re-asking per document buys a call to learn the same nothing. The transport is
+injectable, which is how the degraded paths below were exercised without
+breaking the live token.
+
+Nothing here ever invents an address. Every failure yields an empty
+`actor_email` and a `reason`, and an empty actor is a real answer —
+`memory_read` correctly reports zero prior contacts for it.
+
+**Verified:** (live tenant, `.venv/bin/python`, `PYTHONPATH=src`)
+
+Before: slack 18 documents, **0 with an actor**, `metadata {}`, `timestamp 0.0`
+on all of them. Gmail 8 documents, 8 with an actor.
+
+After: slack 18/18 with `actor_email 'abhijandyala@gmail.com'`, `actor_id
+'U0BL91BSTDL'`, real timestamps, full connector metadata. Gmail unchanged at
+8/8 with the same five addresses and the same timestamps — the old shape still
+works.
+
+Degraded paths, each producing an empty actor and a stated reason rather than a
+guess: no `SLACK_TOKEN` ("no SLACK_TOKEN configured, so member ids cannot be
+resolved"), transport raising ("users.info failed: RuntimeError: connection
+reset"), `ok:false` ("users.info refused: missing_scope"), bot author ("Slack
+author is a bot or app, which has no address").
+
+- `scripts/eval.py` exit 0: 12 passed / 0 failed / 3 skipped, `complaints_examined
+  26`, all invariants holding across 130 verdicts and 6 scopes. (A4 logged 23
+  documents; the difference is tenant data added since, not this change — the
+  loader returned 18 Slack documents before and after, they simply had no actor.)
+- `scripts/smoke.py --demo-ready` exit 0, 5/5, `memory: hydradb`.
+- `scripts/verify_no_hardcoding.py` exit 0, 3/3.
+- Tenant left at **2 memory rows**. Nothing created, nothing deleted.
+
+**Left undone / for others:**
+
+- **The Slack messages resolve to `abhijandyala@gmail.com`, and the memory seed
+  fixture is keyed on `ops@northbeam.io`.** Proven directly: `memory_read` for
+  `ops@northbeam.io` reads back `times_reported_by_actor 2`, and for
+  `abhijandyala@gmail.com` reads back `0`. Both answers are honest; they are
+  about different people. Re-key `fixtures/` (A5's seed) to
+  `abhijandyala@gmail.com` and the Slack complaint becomes contact 3.
+- The tenant holds each Slack message **twice** — 9 connector-synced documents
+  and 9 hand-ingested duplicates of the same channel, which is why the count is
+  18 for 9 messages. The hand-ingested copies put the member id in the generic
+  `entity_id` rather than in `slack_author_id`, so `_slack_member_id` reads
+  `entity_id` as a member id for Slack documents only; both copies resolve. The
+  duplication itself is an ingest problem, not a loader one, and is untouched.
+- Connector documents have no top-level `id`, so their `Document.id` is the
+  content hash HydraDB enumerates them under. That gives up no source prefix, so
+  `memory._source_of` files a memory written for one as `unattributed`. Noted,
+  not fixed: it is a memory-side question and `memory.py` is out of scope.
