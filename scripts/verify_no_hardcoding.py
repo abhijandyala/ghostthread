@@ -82,10 +82,35 @@ def check_no_inline_thresholds() -> list[str]:
 
 
 def check_reacts_to_data() -> list[str]:
-    """Mutation test. Change the world, the answer must change with it."""
+    """Mutation test. Change the world, the answer must change with it.
+
+    Deliberately run against the offline index rather than the live tenant.
+    The claim under test is that the decision logic is computed from the data,
+    and the local backend makes that deterministic, fast, and free of writes
+    into the shared HydraDB tenant that would pollute real verdicts.
+    """
     sys.path.insert(0, str(ROOT / "src"))
+    from ghostthread import config as gt_config  # noqa: E402
     from ghostthread.pipeline import GhostThread  # noqa: E402
 
+    # Every credential has to be blanked, not just HydraDB: the connectors fall
+    # back to the corpus only when their own token is absent, and otherwise the
+    # mutation would be applied to a file nothing reads.
+    offline = [
+        "HYDRA_TOKEN", "SLACK_TOKEN", "GMAIL_TOKEN", "GMAIL_REFRESH_TOKEN",
+        "LINEAR_TOKEN", "GITHUB_TOKEN", "GITHUB_REPO",
+    ]
+    saved = {name: getattr(gt_config, name) for name in offline}
+    for name in offline:
+        setattr(gt_config, name, "")
+    try:
+        return _mutation_test(GhostThread)
+    finally:
+        for name, value in saved.items():
+            setattr(gt_config, name, value)
+
+
+def _mutation_test(GhostThread) -> list[str]:
     baseline = GhostThread().run(act_on_leaks=False)
     base_leaks = {r["canonical_id"] for r in baseline.results if r["verdict"] == "leaked"}
 
@@ -94,9 +119,11 @@ def check_reacts_to_data() -> list[str]:
     # Track one currently-leaked complaint by adding matching work. If the
     # verdict does not flip, the answer was not being computed from the data.
     victim = next(
-        c for c in corpus["complaints"]
-        if f"{c['source']}:{c['id']}" in base_leaks
+        (c for c in corpus["complaints"] if f"{c['source']}:{c['id']}" in base_leaks),
+        None,
     )
+    if victim is None:
+        return ["mutation test: corpus produced no leaks, so there is nothing to flip"]
     corpus["work"].append(
         {
             "id": "MUT-1",

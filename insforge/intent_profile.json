@@ -22,5 +22,7 @@
   "auto_fix_allowed": true,
   "auto_fix_max_severity": 0.6,
   "auto_reply_allowed": true,
-  "escalation_contact": "oncall@example.com"
+  "escalation_contact": "oncall@example.com",
+  "anchor_github_via_linear": false,
+  "recall_mode": "auto"
 }
