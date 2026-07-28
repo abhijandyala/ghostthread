@@ -18,7 +18,7 @@ import time
 from typing import Any, Optional
 
 from . import config
-from .contracts import ComplaintEvent, ExtractedFacts
+from .contracts import FALLBACK_CATEGORY, ComplaintEvent, ExtractedFacts
 
 FACT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -126,6 +126,28 @@ class Extractor:
     )
     _NONCODE_CUES = ("invoice", "tax", "billing", "account", "seat", "contract", "refund")
 
+    # PROVISIONAL. A coarse cue map so the degraded path emits a category and a
+    # confidence at all, which is what keeps the router from collapsing every
+    # complaint to the fallback. The real 13-way classification is the Pipeshift
+    # constrained decode; this is only what runs with no API key.
+    _CATEGORY_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("security_concern", ("security", "breach", "leak between", "vulnerab", "should not be able to see")),
+        ("billing_or_account", ("invoice", "billing", "charged", "refund", "seat", "subscription")),
+        ("outage_or_urgent", ("outage", "site is down", "everything is down", "completely broken")),
+        ("feature_request", ("would be nice", "feature request", "can you add", "wish there was")),
+        ("question", ("how do", "how can", "quick q", "where do i", "couldn't find")),
+        ("feedback_positive", ("great", "love it", "thanks", "saved us", "getting really good feedback")),
+        ("genuine_bug", ("error", "fails", "broken", "not working", "times out", "500", "504", "stale", "overlaps", "dropping")),
+    )
+
+    def _classify_heuristic(self, text: str) -> tuple[str, float]:
+        """Returns (category, confidence). Confidence tracks how many cues hit."""
+        for category, cues in self._CATEGORY_CUES:
+            hits = sum(1 for cue in cues if cue in text)
+            if hits:
+                return category, round(min(1.0, 0.55 + 0.15 * hits), 3)
+        return FALLBACK_CATEGORY, 0.3
+
     def _extract_heuristic(self, complaint: ComplaintEvent) -> ExtractedFacts:
         text = complaint.text.lower()
         severity = 0.25 + sum(w for cue, w in self._SEVERITY_CUES.items() if cue in text)
@@ -142,11 +164,14 @@ class Extractor:
         summary = complaint.text.split(". ")[0].strip()
         if summary.lower().startswith("subject:"):
             summary = summary[len("subject:"):].strip()
+        category, confidence = self._classify_heuristic(text)
         return ExtractedFacts(
             complaint_id=complaint.id,
             what_broke=summary[:200],
             is_code_issue=is_code,
             file_hint=hint,
             severity=round(max(0.0, min(1.0, severity)), 3),
+            category=category,
+            confidence=confidence,
             model="heuristic-fallback",
         )

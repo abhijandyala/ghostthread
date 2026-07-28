@@ -33,7 +33,7 @@ from typing import Any, Optional
 import hydra_db
 
 from . import config
-from .contracts import IntentProfile, LeakVerdict, WorkItemRef
+from .contracts import IntentProfile, LeakResult, LeakVerdict, WorkItemRef
 from .intent import get_profile
 
 COMPLAINT_PROVIDERS = ("slack", "gmail")
@@ -611,6 +611,61 @@ def detect_leaks(
     merged = _merge_clusters(verdicts)
     order = {"leak": 0, "unknown": 1, "resolved": 2}
     return sorted(merged, key=lambda v: (order.get(v.verdict, 3), -(v.confidence or 0.0)))
+
+
+# --- interop with the 8-node pipeline ----------------------------------------
+# `baseline` wires node N2 to `leaks.find_leaks`, which speaks LeakResult, while
+# the PRD specifies LeakVerdict for Track A's own surface. Rather than pick one
+# and break the other, A2 keeps LeakVerdict and offers this adapter, so N2 can
+# move onto the HydraDB-native path in a single line when Track B is ready.
+
+_VERDICT_TO_LEAK_RESULT = {
+    "leak": "leaked",
+    "resolved": "actioned",
+    "unknown": "unknown_insufficient_sources",
+}
+
+
+def to_leak_result(verdict: LeakVerdict) -> LeakResult:
+    """Express a LeakVerdict in the pipeline's LeakResult shape.
+
+    One detail is lossy and worth knowing: LeakResult.confidence is a float, so
+    the PRD's "confidence is null whenever the verdict is unknown" becomes 0.0.
+    The distinction survives in the verdict string itself, which is what the UI
+    and the kill-shot panel key on.
+    """
+    complaint = {
+        "id": verdict.complaint_ids[0] if verdict.complaint_ids else verdict.issue_cluster_id,
+        "source": verdict.issue_cluster_id.split(":", 1)[0],
+        "text": verdict.complaint_texts[0] if verdict.complaint_texts else "",
+        "author_email": verdict.actor_emails[0] if verdict.actor_emails else "",
+        "channel_or_thread": "",
+        "entity_id": "",
+        "t": 0.0,
+    }
+    matched = verdict.matched_work_items[0] if verdict.matched_work_items else None
+    return LeakResult(
+        canonical_id=verdict.issue_cluster_id,
+        complaint=complaint,
+        matched_work=matched,
+        verdict=_VERDICT_TO_LEAK_RESULT.get(verdict.verdict, verdict.verdict),
+        sources_used=verdict.providers_used,
+        confidence=verdict.confidence or 0.0,
+        score=verdict.best_score,
+        threshold=verdict.threshold,
+        signals=[{"name": "reason", "value": 0.0, "weight": 0.0, "source": "hydradb", "detail": r} for r in verdict.reasons],
+        unanswered=verdict.verdict == "leak",
+        evidence_sources=[w["source"] for w in verdict.matched_work_items],
+        sources_missing=verdict.providers_missing,
+    )
+
+
+def detect_leaks_as_results(
+    providers_in_scope: Optional[list[str]] = None,
+    profile: Optional[IntentProfile] = None,
+) -> list[LeakResult]:
+    """Drop-in replacement for `leaks.find_leaks` backed by the A2 query."""
+    return [to_leak_result(v) for v in detect_leaks(providers_in_scope, profile)]
 
 
 def summarise(verdicts: list[LeakVerdict]) -> dict[str, Any]:

@@ -1,10 +1,19 @@
-PY := .venv/bin/python
+# Windows venvs put the interpreter in Scripts/, POSIX ones in bin/. Detect
+# rather than picking one, because this repo gets built on both.
+PY := $(shell if [ -x .venv/Scripts/python.exe ]; then echo .venv/Scripts/python.exe; else echo .venv/bin/python; fi)
+UVICORN := $(shell if [ -x .venv/Scripts/uvicorn.exe ]; then echo .venv/Scripts/uvicorn.exe; else echo .venv/bin/uvicorn; fi)
 export PYTHONPATH := src
 
-.PHONY: demo verify killshot run seed test
+.PHONY: demo verify killshot run seed test smoke demo-ready venv
+
+venv:
+	python -m venv .venv
+	$(PY) -m pip install -q --upgrade pip
+	$(PY) -m pip install -q -r requirements.txt
+	@echo "venv ready"
 
 demo:
-	.venv/bin/uvicorn ghostthread.api:app --host 0.0.0.0 --port 8000 --reload
+	$(UVICORN) ghostthread.api:app --host 0.0.0.0 --port 8000 --reload
 
 run:
 	$(PY) -c "import json;from ghostthread.pipeline import GhostThread;print(json.dumps(GhostThread().run().to_dict()['summary'],indent=2))"
@@ -15,7 +24,15 @@ killshot:
 verify:
 	$(PY) scripts/verify_no_hardcoding.py
 
+# The sync-point check. Run before every merge to main.
+smoke:
+	$(PY) scripts/smoke.py
+
+# The pre-stage check. Same as smoke, but a stubbed node is a failure.
+demo-ready:
+	$(PY) scripts/smoke.py --demo-ready
+
 seed:
 	$(PY) scripts/seed_insforge.py
 
-test: verify killshot
+test: smoke verify killshot
