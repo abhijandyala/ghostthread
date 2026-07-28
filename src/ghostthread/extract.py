@@ -18,14 +18,45 @@ import time
 from typing import Any, Optional
 
 from . import config
-from .contracts import FALLBACK_CATEGORY, ComplaintEvent, ExtractedFacts
+from .contracts import CATEGORIES, FALLBACK_CATEGORY, ComplaintEvent, ExtractedFacts
 
+# The category enum is generated from the taxonomy rather than written out, so
+# a category can never exist in `contracts.CATEGORIES` without the model being
+# allowed to emit it. `strict: true` means the model physically cannot return a
+# value outside this list -- there is no post-hoc validation to forget.
 FACT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "what_broke": {
             "type": "string",
             "description": "One sentence, concrete, naming the failing behaviour.",
+        },
+        "category": {
+            "type": "string",
+            "enum": list(CATEGORIES),
+            "description": "The single best-fitting triage category.",
+        },
+        "confidence": {
+            "type": "number",
+            "description": (
+                "0 to 1. How certain the category is. Be honest: a vague or "
+                "ambiguous message should score low, which routes it to a human."
+            ),
+        },
+        "actor_type": {
+            "type": "string",
+            "enum": ["customer", "internal_employee", "unknown", "automated"],
+            "description": "Who is speaking. Automated covers alerts and bot notifications.",
+        },
+        "sentiment": {
+            "type": "string",
+            "enum": ["neutral", "frustrated", "angry", "positive"],
+            "description": "The reporter's tone, not the severity of the problem.",
+        },
+        "urgency": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"],
+            "description": "How fast this needs a response, from the reporter's position.",
         },
         "is_code_issue": {
             "type": "boolean",
@@ -39,19 +70,71 @@ FACT_SCHEMA: dict[str, Any] = {
             "type": "number",
             "description": "0 to 1. Silent data loss and security are high, cosmetic is low.",
         },
+        "multi_intent": {
+            "type": "boolean",
+            "description": "True if the message contains more than one distinct issue.",
+        },
+        "references_existing_ticket": {
+            "type": "string",
+            "description": (
+                "A ticket or issue id the message names outright (e.g. ENG-412, #88). "
+                "Empty string if none. Never guess one."
+            ),
+        },
     },
-    "required": ["what_broke", "is_code_issue", "file_hint", "severity"],
+    "required": [
+        "what_broke",
+        "category",
+        "confidence",
+        "actor_type",
+        "sentiment",
+        "urgency",
+        "is_code_issue",
+        "file_hint",
+        "severity",
+        "multi_intent",
+        "references_existing_ticket",
+    ],
     "additionalProperties": False,
 }
 
+# Built from the taxonomy so the prompt and the enum can never drift apart.
+_CATEGORY_GUIDE = "\n".join(
+    f"  {name} -- {meaning}"
+    for name, meaning in (
+        ("genuine_bug", "a real product defect"),
+        ("user_error", "works as intended, the user misunderstood"),
+        ("question", "a how-to or clarification request"),
+        ("feature_request", "asking for something that does not exist yet"),
+        ("feedback_positive", "praise or thanks"),
+        ("feedback_negative", "dissatisfaction with no specific defect named"),
+        ("duplicate_or_known_issue", "the message itself names an existing ticket"),
+        ("security_concern", "a possible vulnerability or data exposure"),
+        ("billing_or_account", "payment, invoicing, seats or subscription"),
+        ("outage_or_urgent", "broad or severe: the product is down for many users"),
+        ("spam_or_unrelated", "not a complaint about this product at all"),
+        ("internal_notice", "an employee reporting their own change or breakage"),
+        ("unclear", "genuinely cannot tell what is being reported"),
+    )
+)
+
 SYSTEM_PROMPT = (
     "You are a triage extractor for a software company's support pipeline. "
-    "Given one customer complaint, return only the structured facts requested. "
+    "Given one customer complaint, return only the structured facts requested.\n\n"
+    "Categories:\n"
+    f"{_CATEGORY_GUIDE}\n\n"
     "Judge severity by user impact: silent data loss, security exposure and billing "
     "errors are high; broken core workflows are medium; cosmetic and documentation "
-    "issues are low. Set is_code_issue to false for account, billing, configuration "
-    "and infrastructure problems that no source change would fix. "
-    "Only give a file_hint when the complaint points clearly at one component."
+    "issues are low. Severity is about consequence; urgency is about how fast the "
+    "reporter needs an answer; sentiment is only their tone. They are independent.\n\n"
+    "Set is_code_issue to false for account, billing, configuration and infrastructure "
+    "problems that no source change would fix. "
+    "Only give a file_hint when the complaint points clearly at one component.\n\n"
+    "Confidence is the single most important field. Downstream, anything below the "
+    "configured floor is routed to a human instead of being acted on automatically, "
+    "so an honest low score is a correct and useful answer. Do not inflate it to seem "
+    "decisive. Only use duplicate_or_known_issue when the message actually names a "
+    "ticket; do not infer one. Never invent a ticket id."
 )
 
 
@@ -102,12 +185,29 @@ class Extractor:
         )
         payload = json.loads(resp.choices[0].message.content)
         hint = (payload.get("file_hint") or "").strip()
+        ticket = (payload.get("references_existing_ticket") or "").strip()
+
+        # `strict: true` constrains the enum, but a category the taxonomy does
+        # not know would still crash the router's policy lookup. Fall back
+        # rather than trust it -- an unroutable category is worse than an
+        # honest "unclear".
+        category = payload.get("category") or FALLBACK_CATEGORY
+        if category not in CATEGORIES:
+            category = FALLBACK_CATEGORY
+
         return ExtractedFacts(
             complaint_id=complaint.id,
             what_broke=payload["what_broke"],
             is_code_issue=bool(payload["is_code_issue"]),
             file_hint=hint or None,
             severity=max(0.0, min(1.0, float(payload["severity"]))),
+            category=category,
+            confidence=max(0.0, min(1.0, float(payload.get("confidence", 0.0)))),
+            actor_type=payload.get("actor_type") or "unknown",
+            sentiment=payload.get("sentiment") or "neutral",
+            urgency=payload.get("urgency") or "low",
+            multi_intent=bool(payload.get("multi_intent", False)),
+            references_existing_ticket=ticket or None,
             model=config.PIPESHIFT_MODEL,
         )
 
