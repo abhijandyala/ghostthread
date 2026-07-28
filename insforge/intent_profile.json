@@ -1,5 +1,5 @@
 {
-  "version": "1",
+  "version": "2",
   "watch_sources": [
     "slack",
     "gmail"
@@ -22,5 +22,129 @@
   "auto_fix_allowed": true,
   "auto_fix_max_severity": 0.6,
   "auto_reply_allowed": true,
-  "escalation_contact": "oncall@example.com"
+  "escalation_contact": "oncall@example.com",
+  "anchor_github_via_linear": false,
+  "recall_mode": "auto",
+  "reply_tone_thresholds": {
+    "returning": 1,
+    "escalation": 3
+  },
+  "severity_bands": {
+    "low": 0.33,
+    "medium": 0.66,
+    "high": 1.0
+  },
+  "category_policy": {
+    "genuine_bug": {
+      "allowed_actions": [
+        "file_ticket",
+        "propose_sandbox_fix",
+        "reply"
+      ],
+      "requires_human_approval": false,
+      "autofix_max_severity": 0.6,
+      "customer_facing": true,
+      "escalate_on_risk": true
+    },
+    "user_error": {
+      "allowed_actions": [
+        "reply"
+      ],
+      "requires_human_approval": false,
+      "customer_facing": true
+    },
+    "question": {
+      "allowed_actions": [
+        "reply"
+      ],
+      "requires_human_approval": false,
+      "customer_facing": true
+    },
+    "feature_request": {
+      "allowed_actions": [
+        "file_ticket_tagged_feature",
+        "reply"
+      ],
+      "requires_human_approval": false,
+      "customer_facing": true
+    },
+    "feedback_positive": {
+      "allowed_actions": [
+        "reply"
+      ],
+      "requires_human_approval": false,
+      "customer_facing": true
+    },
+    "feedback_negative": {
+      "allowed_actions": [
+        "log_only",
+        "reply"
+      ],
+      "requires_human_approval": false,
+      "customer_facing": true,
+      "escalate_on_risk": true
+    },
+    "duplicate_or_known_issue": {
+      "allowed_actions": [
+        "link_existing_ticket",
+        "reply"
+      ],
+      "requires_human_approval": false,
+      "customer_facing": true,
+      "escalate_on_risk": true
+    },
+    "security_concern": {
+      "allowed_actions": [
+        "escalate"
+      ],
+      "requires_human_approval": true,
+      "escalation_contact": "security-lead",
+      "customer_facing": true
+    },
+    "billing_or_account": {
+      "allowed_actions": [
+        "escalate"
+      ],
+      "requires_human_approval": true,
+      "escalation_contact": "billing-ops",
+      "customer_facing": true
+    },
+    "outage_or_urgent": {
+      "allowed_actions": [
+        "file_ticket",
+        "escalate"
+      ],
+      "requires_human_approval": true,
+      "escalation_contact": "on-call",
+      "customer_facing": true
+    },
+    "spam_or_unrelated": {
+      "allowed_actions": [],
+      "requires_human_approval": false,
+      "customer_facing": false
+    },
+    "internal_notice": {
+      "allowed_actions": [
+        "file_ticket_internal"
+      ],
+      "requires_human_approval": false,
+      "customer_facing": false,
+      "escalate_on_risk": true
+    },
+    "unclear": {
+      "allowed_actions": [
+        "escalate"
+      ],
+      "requires_human_approval": true,
+      "escalation_contact": "triage-owner",
+      "customer_facing": true
+    }
+  },
+  "global_overrides": {
+    "min_confidence_for_autoaction": 0.65,
+    "never_automerge": true,
+    "sandbox_repo_allowlist": [
+      "testteam-agentsloveyou2hackathon/testteam"
+    ]
+  }
 }
