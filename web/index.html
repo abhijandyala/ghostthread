@@ -68,35 +68,8 @@
           color: var(--dim); text-transform: uppercase; letter-spacing: 0.05em; }
   .pill.fix { color: var(--accent); border-color: #1f4a44; }
   .pill.esc { color: var(--warn); border-color: #4a3d1f; }
-  .pill.warn { color: var(--warn); border-color: #4a3d1f; }
-  .pill.bad { color: var(--bad); border-color: #4a2020; }
-  .pill.good { color: var(--good); border-color: #1f4034; }
   .muted { color: var(--dim); font-size: 13px; }
   label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
-
-  /* connector toggles — the kill shot handle, driven from the same scope the
-     API threads all the way down to the query */
-  .toggles { display: flex; gap: 8px; flex-wrap: wrap; }
-  .toggle { display: flex; align-items: center; gap: 7px; background: var(--panel2);
-            border: 1px solid var(--line); border-radius: 7px; padding: 7px 12px;
-            cursor: pointer; font: 13px var(--mono); color: var(--dim); user-select: none; }
-  .toggle input { width: auto; margin: 0; accent-color: var(--accent); cursor: pointer; }
-  .toggle.on { color: var(--text); border-color: #1f4a44; }
-  .toggle.off { opacity: 0.65; text-decoration: line-through; }
-
-  /* honesty banner: stubs, policy problems, degraded backends */
-  .banner { border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px;
-            border: 1px solid var(--line); background: var(--panel); }
-  .banner.warn { border-color: #4a3d1f; background: rgba(251,191,36,0.07); }
-  .banner.bad { border-color: #4a2020; background: rgba(248,113,113,0.07); }
-  .banner b { display: block; margin-bottom: 4px; }
-  .banner ul { margin: 4px 0 0; padding-left: 18px; color: var(--dim); }
-
-  .mem { background: var(--panel2); border-radius: 8px; padding: 12px; margin-bottom: 10px;
-         border-left: 3px solid var(--line); }
-  .mem.has { border-left-color: var(--accent); }
-  .mem .who { font: 12px var(--mono); color: var(--text); }
-  .cost { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 </style>
 </head>
 <body>
@@ -109,18 +82,9 @@
 
 <div class="question" id="question">Loading…</div>
 
-<div id="banners"></div>
-
 <div class="panel">
-  <h2>Connectors in scope</h2>
-  <p class="muted" style="margin-top:-6px">
-    This list is threaded down to the retrieval query itself — an unchecked source is
-    genuinely never read, not filtered out afterwards. Uncheck GitHub and watch the
-    regression evidence disappear from the drafted fix.
-  </p>
-  <div class="toggles" id="toggles"></div>
-  <div class="row" style="margin-top:14px">
-    <button id="runBtn">Run</button>
+  <div class="row">
+    <button id="runBtn">Run across all four sources</button>
     <button id="killBtn" class="ghost">Run the kill shot</button>
     <span id="status" class="muted"></span>
   </div>
@@ -139,21 +103,6 @@
     <div class="panel">
       <h2>Kill shot — same question, fewer sources</h2>
       <div id="killshot" class="muted">Not run yet.</div>
-    </div>
-
-    <div class="panel">
-      <h2>Memory read <span class="pill" id="memoryBackend">—</span></h2>
-      <p class="muted" style="margin-top:-6px">
-        What we already knew about this reporter and this topic, <em>before</em> anything was
-        decided. Zero prior contacts is a real and common answer, and it is shown as one.
-      </p>
-      <div id="memory" class="muted">Not run yet.</div>
-    </div>
-
-    <div class="panel">
-      <h2>Cost and latency</h2>
-      <div class="cost" id="cost"></div>
-      <p class="muted" id="costNote" style="margin-top:12px">Not run yet.</p>
     </div>
 
     <div class="panel">
@@ -195,167 +144,16 @@ const esc = s => String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;'
 
 let lastRun = null;
 
-// --- connector scope ---------------------------------------------------------
-// The same four names the API and the retrieval layer use. Nothing derived, so
-// a toggle here is literally the `sources` list the query is scoped by.
-const ALL_SOURCES = ['slack', 'gmail', 'linear', 'github'];
-const COMPLAINT_SOURCES = ['slack', 'gmail'];
-
-function renderToggles() {
-  $('#toggles').innerHTML = ALL_SOURCES.map(s => `
-    <label class="toggle on" data-src="${s}">
-      <input type="checkbox" value="${s}" checked /> ${s}
-      <span class="muted" style="font-size:11px">${COMPLAINT_SOURCES.includes(s) ? 'complaints' : 'tracked work'}</span>
-    </label>`).join('');
-  $('#toggles').querySelectorAll('input').forEach(i => i.onchange = onToggle);
-}
-
-function selectedSources() {
-  return [...$('#toggles').querySelectorAll('input')].filter(i => i.checked).map(i => i.value);
-}
-
-function onToggle() {
-  $('#toggles').querySelectorAll('label').forEach(l => {
-    const on = l.querySelector('input').checked;
-    l.className = 'toggle ' + (on ? 'on' : 'off');
-  });
-  const sel = selectedSources();
-  $('#runBtn').textContent = sel.length === ALL_SOURCES.length
-    ? 'Run across all four sources'
-    : `Run scoped to ${sel.join(' + ') || 'nothing'}`;
-  $('#runBtn').disabled = false;
-}
-
-/** The degradation ladder, plus whatever the judge has currently selected.
- *  The full four-source scope always stays in, because killshot.py scores every
- *  narrower scope against the widest one — drop it and there is no reference. */
-function killshotScopes() {
-  const key = s => s.slice().sort().join(',');
-  const ladder = [['slack'], ['slack', 'linear'], ['slack', 'gmail', 'linear']];
-  const sel = selectedSources();
-  if (sel.length && !ladder.some(s => key(s) === key(sel)) && key(sel) !== key(ALL_SOURCES)) {
-    ladder.push(sel);
-  }
-  ladder.push(ALL_SOURCES.slice());
-  return ladder;
-}
-
 function renderCaps(caps, backends) {
-  // Defaults rather than a throw: a page that dies on a malformed /health tells
-  // a judge nothing, where an all-"local" badge row at least tells the truth.
-  caps = caps || {}; backends = backends || {};
   const items = [
     ['HydraDB', backends.grounding === 'hydradb'],
     ['Pipeshift', backends.extraction === 'pipeshift'],
-    ['DeepSeek Coder', !!caps.pipeshift_code_model],
     ['InsForge', backends.intent_profile === 'insforge'],
-    ['actions_log', backends.idempotency === 'insforge'],
+    ['coding agent', caps.coding_agent],
   ];
   $('#caps').innerHTML = items.map(([n, on]) =>
     `<span class="tag ${on ? 'on' : 'off'}">${n}: ${on ? 'live' : 'local'}</span>`).join('')
     + `<span class="tag ${caps.dry_run ? 'off' : 'on'}">${caps.dry_run ? 'dry run' : 'LIVE WRITES'}</span>`;
-}
-
-// --- the honesty banner ------------------------------------------------------
-// Stubs and policy problems are carried on every RunReport specifically so they
-// cannot be invisible. A stubbed node that nobody can see is the failure mode
-// that survives right up to the stage.
-function renderBanners(report) {
-  const out = [];
-
-  if ((report.policy_problems || []).length) {
-    out.push(`<div class="banner bad"><b>Policy problems — routing may be undefined</b>
-      <ul>${report.policy_problems.map(p => `<li>${esc(p)}</li>`).join('')}</ul></div>`);
-  }
-
-  if ((report.stubs || []).length) {
-    out.push(`<div class="banner warn"><b>Stubbed nodes — not demo-ready</b>
-      <ul>${report.stubs.map(s => `<li>${esc(s)} is a placeholder. Anything downstream of it
-        is running on an honest empty result, not on real data.</li>`).join('')}</ul></div>`);
-  }
-
-  const idem = report.idempotency || {};
-  if (idem.degraded) {
-    out.push(`<div class="banner warn"><b>Idempotency is degraded</b>
-      <ul><li>${esc(idem.reason || 'InsForge actions_log unavailable')}</li>
-      <li>Survives a restart: <b>no</b>. Spans instances: <b>no</b>. A retried webhook that
-      lands elsewhere would be processed twice.</li></ul></div>`);
-  }
-
-  $('#banners').innerHTML = out.join('');
-}
-
-// --- memory panel ------------------------------------------------------------
-// Renders exactly what memory_read returned. While N1 is stubbed that is zeros,
-// and it says so rather than hiding the panel — a panel that disappears when
-// the memory is empty would make an unwired memory look like a wired one.
-function renderMemory(report) {
-  const acts = (report.actions || []).filter(a => a.memory && a.memory.actor);
-  $('#memoryBackend').textContent = (report.backends || {}).memory || '—';
-
-  if (!acts.length) {
-    $('#memory').innerHTML = '<span class="muted">No memory reads in this run.</span>';
-    return;
-  }
-
-  const stubbed = acts.some(a => a.memory.stub);
-  const head = stubbed
-    ? `<div class="banner warn" style="margin-bottom:12px">The memory read is still a stub. Every
-       count below is a real zero returned by a placeholder, not a measured zero. Reply tone is
-       therefore <b>first_contact</b> for everyone, which is the correct output for "no history"
-       and the wrong output for a customer on their third complaint.</div>`
-    : '';
-
-  $('#memory').innerHTML = head + acts.slice(0, 8).map(a => {
-    const m = a.memory;
-    const has = m.times_reported_by_actor > 0 || m.times_seen_on_topic > 0;
-    const priors = (m.prior_resolutions || []).map(p =>
-      `<div class="sig"><b>prior</b><span>${esc(p.summary)} — ${esc(p.ticket_url)}</span></div>`).join('');
-    const reg = m.likely_regression
-      ? `<div class="sig"><b>implicated</b><span>${esc(m.likely_regression.source)} ${esc(m.likely_regression.ref)}</span></div>`
-      : `<div class="sig"><b>implicated</b><span class="muted">nothing — the fix has no target from history</span></div>`;
-    return `<div class="mem ${has ? 'has' : ''}">
-      <div class="who">${esc(m.actor)} ${m.stub ? '<span class="pill warn">stub</span>' : ''}</div>
-      <div class="sig"><b>prior contacts</b><span>${m.times_reported_by_actor} from this reporter ·
-        ${m.times_seen_on_topic} on this topic</span></div>
-      ${has ? priors : '<div class="sig"><b>history</b><span class="muted">no prior history — first contact</span></div>'}
-      ${reg}
-      <div class="sig"><b>scoped to</b><span>${esc((m.sources_used || []).join(', ') || 'nothing')}</span></div>
-      <div class="sig"><b>reply tone</b><span>${esc(a.facts.reply_tone)}</span></div>
-    </div>`;
-  }).join('');
-}
-
-// --- cost counter ------------------------------------------------------------
-// Sums what the pipeline actually recorded. Where nothing metered ran, it says
-// zero and says why, rather than showing a plausible-looking number.
-function renderCost(report) {
-  const acts = report.actions || [];
-  const cost = acts.reduce((n, a) => n + (a.cost_usd || 0), 0);
-  const latency = acts.reduce((n, a) => n + (a.latency_ms || 0), 0);
-
-  let hosted = 0, local = 0;
-  acts.forEach(a => {
-    (a.facts.model && a.facts.model !== 'heuristic-fallback') ? hosted++ : local++;
-    const gen = ((a.meta || {}).fix || {}).generator;
-    if (gen && gen.backend && gen.backend !== 'none') hosted++;
-  });
-
-  const cells = [
-    ['cost so far', '$' + cost.toFixed(4)],
-    ['hosted model calls', hosted],
-    ['pipeline time', report.elapsed_ms.toFixed(0) + 'ms'],
-  ];
-  $('#cost').innerHTML = cells.map(([k, v]) =>
-    `<div class="stat"><b>${v}</b><small>${k}</small></div>`).join('');
-
-  $('#costNote').innerHTML = hosted === 0
-    ? `No hosted model calls were made — ${local} classification(s) ran on the local heuristic
-       and no fix generator is configured, so the true cost of this run is zero. This counter
-       reports what was spent, not an estimate of what it would have cost.`
-    : `${hosted} hosted call(s) across ${acts.length} resolution(s), ${latency.toFixed(0)}ms of
-       action time. Per-call pricing is not published back to us, so cost is only counted where
-       the pipeline recorded it.`;
 }
 
 function statBlock(s) {
@@ -366,57 +164,6 @@ function statBlock(s) {
     ['customer-hours waiting', s.unanswered_customer_hours.toFixed(0)],
   ];
   return cells.map(([k, v]) => `<div class="stat"><b>${v}</b><small>${k}</small></div>`).join('');
-}
-
-// The router's output, in full. `reason` is the sentence that explains why this
-// complaint was treated the way it was, and it is the first thing a judge asks
-// for — so it is on screen rather than buried in the JSON.
-function routingBlock(a) {
-  const r = a.routing || {};
-  const acts = (r.actions || []);
-  const pills = acts.map(x =>
-    `<span class="pill ${x === 'propose_sandbox_fix' ? 'fix' : (x === 'escalate' ? 'esc' : '')}">${esc(x)}</span>`
-  ).join('') || '<span class="pill">no action permitted</span>';
-
-  return `<div>
-    <span class="pill ${r.forced_fallback ? 'warn' : ''}">${esc(r.category || '—')}${r.forced_fallback ? ' (forced)' : ''}</span>
-    ${pills}
-    <span class="pill">ticket ${esc(a.ticket_created_id || '—')}</span>
-    ${r.requires_human_approval ? '<span class="pill warn">human approval</span>' : ''}
-    ${a.idempotent_replay ? '<span class="pill good">idempotent replay — not re-actioned</span>' : ''}
-  </div>
-  <div class="sig" style="margin-top:8px"><b>routing reason</b><span>${esc(r.reason || a.decision)}</span></div>
-  <div class="sig"><b>escalation to</b><span>${esc(r.escalation_contact || '—')} · reply → ${esc(a.reply_channel || 'withheld')}</span></div>`;
-}
-
-// The drafted patch, including the two things that must never be silent: which
-// model produced it, and whether it cleared the profile's confidence gate.
-function fixBlock(a) {
-  const fix = (a.meta || {}).fix;
-  if (!fix) return '';
-  const gen = fix.generator || {};
-  const conf = (fix.confidence === null || fix.confidence === undefined)
-    ? 'not reported' : Number(fix.confidence).toFixed(2);
-  const gateCls = fix.low_confidence ? 'warn' : 'good';
-
-  const degraded = fix.degraded
-    ? `<div class="sig"><b>degraded</b><span class="pill warn">${esc(fix.degraded_reason || 'degraded')}</span></div>`
-    : '';
-
-  const body = a.fix_attempted
-    ? `<div class="sig"><b>files touched</b><span>${esc((fix.files_touched || []).join(', ') || 'not reported')}</span></div>
-       <div class="sig"><b>explanation</b><span>${esc(fix.explanation || '—')}</span></div>`
-    : `<div class="sig"><b>no patch</b><span>${esc(fix.result || fix.blocked || 'no patch was drafted')}</span></div>`;
-
-  return `<div style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)">
-    <span class="pill fix">fix generator: ${esc(gen.backend || 'none')}${gen.model ? ' · ' + esc(gen.model) : ''}</span>
-    <span class="pill ${gateCls}">${esc(fix.pr_label || '—')}</span>
-    <span class="pill">${fix.targeted ? 'targeted by regression evidence' : 'no regression evidence — target is a guess'}</span>
-    <span class="pill">never auto-merged</span>
-    <div class="sig" style="margin-top:8px"><b>fix confidence</b><span>${conf} vs threshold ${Number(fix.confidence_threshold).toFixed(2)} (from the intent profile)</span></div>
-    <div class="sig"><b>allowlist</b><span>${esc(fix.allowlist || fix.blocked || '—')}</span></div>
-    ${degraded}${body}
-  </div>`;
 }
 
 function renderResults(report) {
@@ -433,11 +180,14 @@ function renderResults(report) {
     const a = actionByComplaint[r.canonical_id];
     let action = '';
     if (a) {
+      const pillCls = a.decision === 'auto_fix' ? 'fix' : (a.decision === 'escalate' ? 'esc' : '');
       action = `<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
-        ${routingBlock(a)}
+        <span class="pill ${pillCls}">${esc(a.decision)}</span>
+        <span class="pill">ticket ${esc(a.ticket_created_id || '—')}</span>
+        ${a.fix_attempted ? '<span class="pill fix">patch drafted</span>' : ''}
+        <span class="pill">reply → ${esc(a.reply_channel || '—')}</span>
         <div class="sig" style="margin-top:8px"><b>severity</b><span>${a.facts.severity.toFixed(2)} · ${a.facts.is_code_issue ? 'code' : 'non-code'} · ${esc(a.facts.file_hint || 'no component hint')} · ${esc(a.facts.model)} (${a.facts.latency_ms}ms)</span></div>
         <div class="sig"><b>what broke</b><span>${esc(a.facts.what_broke)}</span></div>
-        ${fixBlock(a)}
       </div>`;
     }
     return `<div class="leak ${cls}">
@@ -473,21 +223,15 @@ function renderKillshot(k) {
 }
 
 async function run() {
-  const sources = selectedSources();
   $('#runBtn').disabled = true; $('#status').textContent = 'running…';
   try {
     lastRun = await api('/run', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sources, act: true })
+      body: JSON.stringify({ sources: null, act: true })
     });
     renderCaps(lastRun.capabilities, lastRun.backends);
-    renderBanners(lastRun);
     renderResults(lastRun);
-    renderMemory(lastRun);
-    renderCost(lastRun);
-    const missing = ALL_SOURCES.filter(s => !sources.includes(s));
-    $('#status').textContent = `${lastRun.elapsed_ms}ms · grounding via ${lastRun.backends.grounding}`
-      + (missing.length ? ` · blind to ${missing.join(', ')}` : '');
+    $('#status').textContent = `${lastRun.elapsed_ms}ms · grounding via ${lastRun.backends.grounding}`;
   } catch (e) { $('#status').textContent = 'error: ' + e; }
   $('#runBtn').disabled = false;
 }
@@ -496,8 +240,7 @@ async function killshot() {
   $('#killBtn').disabled = true; $('#status').textContent = 'degrading sources…';
   try {
     renderKillshot(await api('/killshot', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ scopes: killshotScopes() })
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
     }));
     $('#status').textContent = 'kill shot complete';
   } catch (e) { $('#status').textContent = 'error: ' + e; }
@@ -515,15 +258,12 @@ async function submitLive() {
       body: JSON.stringify({ text, source: $('#liveSource').value, author_email: $('#liveEmail').value })
     });
     const res = r.results[0], act = (r.actions || [])[0];
-    renderBanners(r);
-    if (act) { renderMemory(r); renderCost(r); }
     $('#liveOut').innerHTML = `<div class="leak ${res.verdict === 'leaked' ? '' : 'actioned'}" style="margin-top:14px">
       <div class="meta">${esc(res.canonical_id)} · grounded in ${esc(res.sources_used.join(', '))} ·
         <b style="color:var(--text)">${esc(res.verdict)}</b> (score ${res.score.toFixed(2)})</div>
       ${act ? `<div class="sig"><b>what broke</b><span>${esc(act.facts.what_broke)}</span></div>
       <div class="sig"><b>severity</b><span>${act.facts.severity.toFixed(2)} · ${act.facts.is_code_issue ? 'code issue' : 'non-code'}</span></div>
-      ${routingBlock(act)}
-      ${fixBlock(act)}
+      <div class="sig"><b>decision</b><span>${esc(act.decision)} → ticket ${esc(act.ticket_created_id)}</span></div>
       <pre>${esc((act.meta.reply || {}).body || 'no reply composed')}</pre>` : '<p class="muted">already tracked — no action needed</p>'}
     </div>`;
   } catch (e) { $('#liveOut').innerHTML = '<p class="muted">error: ' + esc(e) + '</p>'; }
@@ -555,11 +295,8 @@ $('#liveBtn').onclick = submitLive;
 $('#saveProfile').onclick = saveProfile;
 
 (async () => {
-  renderToggles();
-  onToggle();
   const h = await api('/health');
   renderCaps(h.capabilities, h.backends);
-  renderBanners({ policy_problems: h.policy_problems, stubs: h.stubs, idempotency: h.idempotency });
   $('#question').textContent = 'Which customer complaints in Slack and Gmail never became tracked work in Linear or GitHub, and who is still waiting on an answer?';
   await loadProfile();
 })();
