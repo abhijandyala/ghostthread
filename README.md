@@ -41,7 +41,9 @@ Those numbers are computed at run time from whatever is loaded, not asserted. Sc
 
 With no Pipeshift key, `fixgen.py` falls back to a general coding model and marks every proposal `degraded`, naming the reason. With no key at all it returns no diff and says so. There is no mode that invents a patch.
 
-**InsForge — enterprise intent.** The intent profile is a row in an InsForge table, read at call time with a five-second TTL. Every threshold, weight and permission in the system comes from it. You can edit the policy in the UI mid-demo, re-run, and watch verdicts and actions change with no code deployment. *(InsForge has no first-class "intent profile" primitive — it's a `json` column addressed by key. Documented rather than pretended.)*
+**InsForge — enterprise intent, and the idempotency log.** The intent profile is a row in an InsForge table, read at call time with a five-second TTL. Every threshold, weight and permission in the system comes from it. You can edit the policy in the UI mid-demo, re-run, and watch verdicts and actions change with no code deployment. *(InsForge has no first-class "intent profile" primitive — it's a `json` column addressed by key. Documented rather than pretended.)*
+
+Pipeline node N8 is a second table, `actions_log`, with `complaint_id` UNIQUE. That constraint — not a lock in the process — is what makes a retried webhook safe across instances and restarts. Without InsForge credentials it degrades to an in-process dict, which is genuinely weaker, so the run report says `idempotency: in-process` and states that it does not survive a restart rather than implying the guarantee still holds.
 
 **RocketRide Cloud — managed pipeline.** `rocketride/ghostthread.pipe` is the deployed node graph: `webhook → agent → {ghostthread_run, ghostthread_killshot} → response`. See the note on the split below.
 
@@ -75,6 +77,7 @@ github ┘   graph)                            (Mistral/Llama)     └─ escala
 | `fixgen.py` | Pipeshift DeepSeek Coder — diff, explanation, confidence |
 | `act.py` | Ticket, sandboxed fix, reply, escalate |
 | `killshot.py` | Scope degradation, scored against the full-source answer |
+| `actions_log.py` | N8 idempotency log — InsForge Postgres, in-process fallback |
 | `pipeline.py` | Orchestration |
 | `api.py` | HTTP surface for RocketRide and the UI |
 
@@ -111,7 +114,8 @@ Every integration degrades independently. With an empty `.env` the whole thing s
 ```bash
 make verify        # the three anti-hardcoding checks
 make killshot      # the degradation table, no server needed
-python scripts/seed_insforge.py    # once, to move the profile into InsForge
+python scripts/seed_insforge.py    # once: creates intent_profiles + actions_log,
+                                   # then moves the profile into InsForge
 ```
 
 ## Known gaps

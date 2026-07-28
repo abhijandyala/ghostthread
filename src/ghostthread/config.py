@@ -45,6 +45,9 @@ INSFORGE_BASE_URL = os.getenv("INSFORGE_BASE_URL", "")
 INSFORGE_API_KEY = os.getenv("INSFORGE_API_KEY", "")
 INSFORGE_TABLE = os.getenv("INSFORGE_TABLE", "intent_profiles")
 INSFORGE_PROFILE_KEY = os.getenv("INSFORGE_PROFILE_KEY", "ghostthread")
+# Pipeline node N8. UNIQUE on complaint_id is what makes a retried webhook safe
+# across instances; see actions_log.py.
+INSFORGE_ACTIONS_TABLE = os.getenv("INSFORGE_ACTIONS_TABLE", "actions_log")
 INTENT_PROFILE_TTL_SECONDS = float(os.getenv("INTENT_PROFILE_TTL_SECONDS", "5"))
 LOCAL_PROFILE_PATH = Path(
     os.getenv("LOCAL_PROFILE_PATH", REPO_ROOT / "insforge" / "intent_profile.json")
@@ -98,6 +101,8 @@ def capability_report() -> dict[str, bool]:
         "hydradb": bool(HYDRA_TOKEN),
         "pipeshift": bool(PIPESHIFT_API_KEY),
         "insforge": bool(INSFORGE_BASE_URL and INSFORGE_API_KEY),
+        # The idempotency log survives a restart only when it is in Postgres.
+        "durable_idempotency": bool(INSFORGE_BASE_URL and INSFORGE_API_KEY),
         "coding_agent": bool(ANTHROPIC_API_KEY),
         # The graded second Pipeshift model. True only when the specialised code
         # deployment is reachable; the Anthropic fallback does not set it.

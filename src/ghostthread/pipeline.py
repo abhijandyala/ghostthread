@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from . import act, config, connectors, memory, router
+from . import act, actions_log, config, connectors, memory, router
 from .contracts import (
     ALL_SOURCES,
     ComplaintEvent,
@@ -68,6 +68,9 @@ class RunReport:
     summary: dict[str, Any]
     elapsed_ms: float
     capabilities: dict[str, bool] = field(default_factory=dict)
+    # N8's backend and what it can actually promise. Rendered in the UI, because
+    # "idempotent" means something different in Postgres than in a dict.
+    idempotency: dict[str, Any] = field(default_factory=dict)
     # Which nodes are still running on placeholder implementations. Empty is the
     # only demo-ready state; the UI badges this and smoke.py fails on it.
     stubs: list[str] = field(default_factory=list)
@@ -165,26 +168,20 @@ def node_memory_write(
     return memory.memory_write(record, grounding)
 
 
-class _IdempotencyLog:
-    """N8. One resolution per complaint id, ever.
+def node_log(
+    complaint_id: str,
+    resolution: ResolutionAction,
+    log: actions_log.ActionsLog,
+) -> dict[str, Any]:
+    """N8. Record the resolution against `complaint_id`, exactly once.
 
-    In-process for now, which is enough to satisfy "file the same complaint
-    twice, get one ticket" on a single instance. Track B swaps the body for the
-    InsForge `actions_log` table with a UNIQUE constraint on `complaint_id`,
-    which is what makes it survive a retried webhook across instances.
+    The guarantee lives in InsForge Postgres as a UNIQUE constraint, so a retried
+    webhook is safe across instances and restarts -- not just within this
+    process. Without credentials it degrades to an in-process mirror, which is
+    genuinely weaker and is reported as such in `RunReport.backends` rather than
+    quietly presented as the same thing.
     """
-
-    def __init__(self) -> None:
-        self._seen: dict[str, dict[str, Any]] = {}
-
-    def seen(self, complaint_id: str) -> Optional[dict[str, Any]]:
-        return self._seen.get(complaint_id)
-
-    def record(self, complaint_id: str, resolution: ResolutionAction) -> None:
-        self._seen.setdefault(complaint_id, resolution.to_dict())
-
-    def clear(self) -> None:
-        self._seen.clear()
+    return log.record(complaint_id, resolution)
 
 
 # --- the engine ---------------------------------------------------------------
@@ -205,7 +202,7 @@ class GhostThread:
         self.complaints: list[ComplaintEvent] = []
         self.work: list[WorkEvent] = []
         self.loaded_counts: dict[str, int] = {}
-        self.action_log = _IdempotencyLog()
+        self.action_log = actions_log.ActionsLog()
         self._loaded = False
 
     def load(self, now: Optional[float] = None, force: bool = False) -> dict[str, int]:
@@ -315,8 +312,8 @@ class GhostThread:
                     continue
 
                 resolution = self.resolve_one(result, complaint, profile, scope)
-                self.action_log.record(complaint.id, resolution)
-                actions.append(resolution.to_dict())
+                logged = node_log(complaint.id, resolution, self.action_log)
+                actions.append({**resolution.to_dict(), "logged": logged})
 
         return RunReport(
             question=QUESTION,
@@ -328,7 +325,11 @@ class GhostThread:
                 "extraction": self.extractor.backend,
                 "intent_profile": profile.origin,
                 "memory": "stub" if memory.IS_STUB else self.grounding.backend,
+                # N8. "in-process" means the dedupe does not survive a restart
+                # and does not span instances -- said plainly, not implied.
+                "idempotency": self.action_log.backend,
             },
+            idempotency=self.action_log.status(),
             identities=self.identities.summary(),
             results=[r.to_dict() for r in results],
             actions=actions,
