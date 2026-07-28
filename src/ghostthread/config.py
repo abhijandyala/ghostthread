@@ -29,16 +29,38 @@ HYDRA_DATABASE = os.getenv("HYDRA_DATABASE", "ghostthread")
 HYDRA_TENANT_ID = os.getenv("HYDRA_TENANT_ID", "ghostthread")
 HYDRA_BASE_URL = os.getenv("HYDRA_BASE_URL") or None
 
-# --- Pipeshift (model specialisation) ---------------------------------------
-PIPESHIFT_API_KEY = os.getenv("PIPESHIFT_API_KEY", "")
-PIPESHIFT_BASE_URL = os.getenv("PIPESHIFT_BASE_URL", "https://api.pipeshift.com/api/v0")
-PIPESHIFT_MODEL = os.getenv("PIPESHIFT_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
-# The second deployed model. Classification wants a fast instruction model;
-# code generation wants one that has read code. Same key, same OpenAI-compatible
-# endpoint, different deployment -- see fixgen.py.
-PIPESHIFT_CODE_MODEL = os.getenv(
-    "PIPESHIFT_CODE_MODEL", "deepseek-ai/deepseek-coder-6.7b-instruct"
-)
+# --- Anthropic (model specialisation, two models) ---------------------------
+# Pipeshift was the original provider here and has been removed: the account had
+# no usable key, and an integration nobody can run is a claim rather than a
+# feature. The specialisation argument is unchanged and is now made with two
+# Anthropic models rather than two Pipeshift deployments -- classification wants
+# a small fast model, code generation wants a model that reasons about code.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+
+def _model(name: str, default: str) -> str:
+    """A blank env var means "not configured", not "use the empty string".
+
+    `PIPESHIFT_MODEL=` in `.env` used to override the code default with "",
+    which sent an empty model id to the API. An unset variable and a variable
+    set to nothing are the same intent, so both fall through to the default.
+    """
+    return (os.getenv(name) or "").strip() or default
+
+
+# N3, classification: every complaint goes through a constrained decode against
+# a fixed JSON schema. Small and fast, because the shape is what matters.
+EXTRACTION_MODEL = _model("EXTRACTION_MODEL", "claude-haiku-4-5")
+# N6, code generation: a diff, an explanation and a confidence. Reasoning about
+# a codebase is the whole task, so this is the strong model.
+CODING_AGENT_MODEL = _model("CODING_AGENT_MODEL", "claude-opus-5")
+# Thinking is on by default on the code model and `max_tokens` caps thinking
+# plus response together, so this has to leave room for both.
+CODING_AGENT_MAX_TOKENS = int(os.getenv("CODING_AGENT_MAX_TOKENS", "8000"))
+EXTRACTION_MAX_TOKENS = int(os.getenv("EXTRACTION_MAX_TOKENS", "1024"))
+# Effort on the code model. Not supported by the small classification model, so
+# it is only ever sent on the code call.
+CODING_AGENT_EFFORT = _model("CODING_AGENT_EFFORT", "medium")
 
 # --- InsForge (intent profile / governance) ---------------------------------
 INSFORGE_BASE_URL = os.getenv("INSFORGE_BASE_URL", "")
@@ -67,12 +89,6 @@ LOCAL_PROFILE_PATH = Path(
     os.getenv("LOCAL_PROFILE_PATH", REPO_ROOT / "insforge" / "intent_profile.json")
 )
 
-# --- Coding agent fallback (NOT the graded Pipeshift requirement) -----------
-# Used by fixgen.py only when PIPESHIFT_API_KEY is absent, and every proposal it
-# produces is labelled degraded.
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CODING_AGENT_MODEL = os.getenv("CODING_AGENT_MODEL", "claude-sonnet-4-20250514")
-CODING_AGENT_MAX_TOKENS = int(os.getenv("CODING_AGENT_MAX_TOKENS", "1500"))
 SANDBOX_REPO = Path(os.getenv("SANDBOX_REPO", REPO_ROOT / "sandbox_repo"))
 
 # --- Write-side connectors ---------------------------------------------------
@@ -126,15 +142,18 @@ def capability_report() -> dict[str, bool]:
     at a glance which integrations are live versus running on local transport."""
     return {
         "hydradb": bool(HYDRA_TOKEN),
-        "pipeshift": bool(PIPESHIFT_API_KEY),
+        # One credential, two models, chosen per task. Both flags read the same
+        # key on purpose: there is no configuration in which classification is
+        # live and code generation is not, and pretending otherwise would put a
+        # green badge next to something that cannot run.
+        "anthropic": bool(ANTHROPIC_API_KEY),
+        "extraction_model": bool(ANTHROPIC_API_KEY),
+        "code_model": bool(ANTHROPIC_API_KEY),
         "insforge": bool(INSFORGE_BASE_URL and INSFORGE_API_KEY),
         # The idempotency log survives a restart only when it is in Postgres.
         "durable_idempotency": bool(INSFORGE_BASE_URL and INSFORGE_API_KEY),
         "coding_agent": bool(ANTHROPIC_API_KEY),
-        # The graded second Pipeshift model. True only when the specialised code
-        # deployment is reachable; the Anthropic fallback does not set it.
-        "pipeshift_code_model": bool(PIPESHIFT_API_KEY),
-        "fix_generator": bool(PIPESHIFT_API_KEY or ANTHROPIC_API_KEY),
+        "fix_generator": bool(ANTHROPIC_API_KEY),
         "linear_write": bool(LINEAR_TOKEN),
         "slack_write": bool(SLACK_TOKEN),
         "gmail_write": bool(

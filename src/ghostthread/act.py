@@ -134,8 +134,8 @@ def create_ticket(
 
 
 # --- sandboxed coding agent ---------------------------------------------------
-# The patch itself comes from `fixgen.py` -- Pipeshift DeepSeek Coder when the
-# key is present, a general coding model (labelled degraded) when it is not.
+# The patch itself comes from `fixgen.py` -- the code model when the key is
+# present, and no patch at all when it is not.
 # This section owns only the safety envelope around it: the allowlist is checked
 # before anything is touched, DRY_RUN gates the write, and the PR is never
 # merged. The repo is disposable and never points at production.
@@ -193,7 +193,7 @@ def attempt_fix(
     ticket_id: Optional[str],
     memory: Optional[MemoryReadResult] = None,
 ) -> tuple[bool, Optional[str], dict[str, Any]]:
-    """Draft a minimal patch inside the sandbox repo, via the Pipeshift code model.
+    """Draft a minimal patch inside the sandbox repo, via the specialised code model.
 
     Order matters and is not negotiable: allowlist first, so a blocked repo is
     never even described to a model; then generate; then the confidence gate;

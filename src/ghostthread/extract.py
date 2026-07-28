@@ -1,13 +1,28 @@
-"""Pipeshift extraction: unstructured complaint text -> structured facts.
+"""N3, classification: unstructured complaint text -> structured facts.
 
 This is the load-bearing model step. Every downstream decision (fix vs reply vs
 escalate) keys off `is_code_issue`, `severity` and `file_hint`, so if this step
 is wrong the agent does the wrong thing.
 
 Specialisation here is a constrained decode against a fixed JSON schema on a
-small open model, not a general chat call. Pipeshift's API is OpenAI-compatible
-and supports `response_format: json_schema` with `strict: true`, so the model
-physically cannot emit a shape we do not expect.
+small fast model, not a general chat call. The provider is Anthropic and the
+mechanism is structured outputs -- `output_config.format` with a `json_schema`
+-- which constrains generation itself rather than asking for JSON and hoping.
+The model physically cannot emit a shape we do not expect.
+
+That distinction is the whole claim, so it is worth being precise about what
+was NOT done: this is not "prompt for JSON and parse it". A prompted model can
+return prose, a fenced block, a missing field or a category that is not in the
+taxonomy, and every one of those has to be caught by hand afterwards. Under a
+constrained decode the shape is a property of generation.
+
+Degradation
+-----------
+With no ANTHROPIC_API_KEY this falls back to the heuristic cue matcher below and
+reports `backend = "heuristic"`. That fallback is genuinely worse -- it is a
+keyword scorer, not a classifier -- which is why it is labelled rather than
+quietly substituted. There is no mode in which a missing credential produces a
+confident-looking classification.
 """
 
 from __future__ import annotations
@@ -22,8 +37,9 @@ from .contracts import CATEGORIES, FALLBACK_CATEGORY, ComplaintEvent, ExtractedF
 
 # The category enum is generated from the taxonomy rather than written out, so
 # a category can never exist in `contracts.CATEGORIES` without the model being
-# allowed to emit it. `strict: true` means the model physically cannot return a
-# value outside this list -- there is no post-hoc validation to forget.
+# allowed to emit it. The schema is enforced during generation, so the model
+# cannot return a value outside this list -- there is no post-hoc validation to
+# forget.
 FACT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -139,24 +155,32 @@ SYSTEM_PROMPT = (
 
 
 class Extractor:
+    """The classification model, or an honest keyword scorer when it is absent.
+
+    `backend` is what `RunReport.backends["extraction"]` reports and what the UI
+    badges, so it names the provider that actually answered.
+    """
+
     def __init__(self) -> None:
-        self.live = bool(config.PIPESHIFT_API_KEY)
-        self.model = config.PIPESHIFT_MODEL if self.live else "heuristic-fallback"
-        self.backend = "pipeshift" if self.live else "heuristic"
+        self.live = bool(config.ANTHROPIC_API_KEY)
+        self.model = config.EXTRACTION_MODEL if self.live else "heuristic-fallback"
+        self.backend = "anthropic" if self.live else "heuristic"
+        # Named separately from `backend` so a viewer can see *which* of the two
+        # models ran, not just that a model ran.
+        self.degraded_reason = (
+            "" if self.live else "ANTHROPIC_API_KEY is not set; classification is a keyword scorer"
+        )
         self._client = None
         if self.live:
-            from openai import OpenAI
+            import anthropic
 
-            self._client = OpenAI(
-                api_key=config.PIPESHIFT_API_KEY,
-                base_url=config.PIPESHIFT_BASE_URL,
-            )
+            self._client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
     def extract(self, complaint: ComplaintEvent) -> ExtractedFacts:
         started = time.perf_counter()
         if self.live:
             try:
-                facts = self._extract_pipeshift(complaint)
+                facts = self._extract_model(complaint)
                 facts.latency_ms = round((time.perf_counter() - started) * 1000, 1)
                 return facts
             except Exception:
@@ -165,32 +189,36 @@ class Extractor:
         facts.latency_ms = round((time.perf_counter() - started) * 1000, 1)
         return facts
 
-    def _extract_pipeshift(self, complaint: ComplaintEvent) -> ExtractedFacts:
-        resp = self._client.chat.completions.create(
-            model=config.PIPESHIFT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": complaint.text},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "extracted_facts",
-                    "strict": True,
-                    "schema": FACT_SCHEMA,
-                },
-            },
-            temperature=0,
-            max_tokens=512,
+    def _extract_model(self, complaint: ComplaintEvent) -> ExtractedFacts:
+        """The graded step: a constrained decode, not a request for JSON.
+
+        `output_config.format` makes FACT_SCHEMA a constraint on generation. No
+        `temperature` is sent -- the small model accepts it, but the code model
+        in fixgen.py rejects it outright, and one calling convention across both
+        is worth more than a determinism knob that never guaranteed determinism.
+        """
+        resp = self._client.messages.create(
+            model=config.EXTRACTION_MODEL,
+            max_tokens=config.EXTRACTION_MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": complaint.text}],
+            output_config={"format": {"type": "json_schema", "schema": FACT_SCHEMA}},
         )
-        payload = json.loads(resp.choices[0].message.content)
+
+        # A safety refusal is not a classification. Raising drops to the
+        # heuristic, which is labelled, rather than inventing a category.
+        if resp.stop_reason == "refusal":
+            raise RuntimeError("classification refused by the model's safety classifiers")
+
+        text = next((b.text for b in resp.content if b.type == "text"), "")
+        payload = json.loads(text)
         hint = (payload.get("file_hint") or "").strip()
         ticket = (payload.get("references_existing_ticket") or "").strip()
 
-        # `strict: true` constrains the enum, but a category the taxonomy does
-        # not know would still crash the router's policy lookup. Fall back
-        # rather than trust it -- an unroutable category is worse than an
-        # honest "unclear".
+        # The schema constrains the enum, but a category the taxonomy does not
+        # know would still crash the router's policy lookup. Fall back rather
+        # than trust it -- an unroutable category is worse than an honest
+        # "unclear".
         category = payload.get("category") or FALLBACK_CATEGORY
         if category not in CATEGORIES:
             category = FALLBACK_CATEGORY
@@ -208,7 +236,7 @@ class Extractor:
             urgency=payload.get("urgency") or "low",
             multi_intent=bool(payload.get("multi_intent", False)),
             references_existing_ticket=ticket or None,
-            model=config.PIPESHIFT_MODEL,
+            model=config.EXTRACTION_MODEL,
         )
 
     # -- degraded path ---------------------------------------------------------
@@ -228,8 +256,8 @@ class Extractor:
 
     # PROVISIONAL. A coarse cue map so the degraded path emits a category and a
     # confidence at all, which is what keeps the router from collapsing every
-    # complaint to the fallback. The real 13-way classification is the Pipeshift
-    # constrained decode; this is only what runs with no API key.
+    # complaint to the fallback. The real 13-way classification is the
+    # constrained decode above; this is only what runs with no API key.
     _CATEGORY_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("security_concern", ("security", "breach", "leak between", "vulnerab", "should not be able to see")),
         ("billing_or_account", ("invoice", "billing", "charged", "refund", "seat", "subscription")),

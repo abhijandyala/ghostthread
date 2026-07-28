@@ -1,29 +1,30 @@
-"""Pipeshift DeepSeek Coder: root cause + regression evidence -> a candidate patch.
+"""N6, code generation: root cause + regression evidence -> a candidate patch.
 
-This is the *second* specialised Pipeshift model, and the reason there are two.
-`extract.py` runs a small instruction model under a constrained decode because
+This is the *second* specialised model, and the reason there are two.
+`extract.py` runs a small fast model under a constrained decode because
 classification wants speed and a fixed shape. Code generation wants a model that
-has actually read code, so it runs against a DeepSeek Coder deployment on the
-same OpenAI-compatible Pipeshift endpoint. Same provider, two endpoints, chosen
-per task -- which is what "model specialisation" means here.
+reasons about code, so it runs against the strong model. Same provider, same
+credential, two models chosen per task -- which is what "model specialisation"
+means here. It used to mean two Pipeshift deployments; the provider changed, the
+argument did not.
 
 The specialisation is not decoration. `regression_evidence` from the memory read
 is threaded into the prompt, and the returned `files_touched` is what makes the
 kill shot visible: scope GitHub away, the evidence goes null, and the patch stops
 being targeted. The model reports that itself rather than us asserting it.
 
-Degradation, in strict order:
+Degradation:
 
-    1. PIPESHIFT_API_KEY set   -> DeepSeek Coder on Pipeshift. Not degraded.
-    2. ANTHROPIC_API_KEY set   -> a general coding model. DEGRADED, and every
-                                  proposal says so in `degraded_reason`, which
-                                  act.py stamps onto the PR metadata.
-    3. neither                 -> no diff at all. `diff` is None and the
-                                  explanation says why.
+    1. ANTHROPIC_API_KEY set -> the code model, under the same constrained
+                                decode discipline as extract.py. Not degraded.
+    2. absent                -> no diff at all. `diff` is None and the
+                                explanation says why.
 
-There is deliberately no fourth mode that invents a plausible-looking patch. A
+There is deliberately no third mode that invents a plausible-looking patch. A
 fabricated diff is worse than no diff, because a reviewer cannot tell it apart
-from a real one.
+from a real one. Note that this rule also covers the model declining: a refusal
+or a truncated response returns `diff=None` with the reason, never a partial
+diff dressed up as a complete one.
 
 Nothing in this module writes anything. It returns a proposal; `act.py` decides
 whether the allowlist, DRY_RUN and the profile's confidence threshold let it
@@ -36,8 +37,6 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
-
-import httpx
 
 from . import config
 
@@ -106,8 +105,8 @@ class FixProposal:
         }
 
 
-# The constrained decode. `strict: true` means the model physically cannot
-# return a shape act.py is not ready to read -- same discipline as extract.py.
+# The constrained decode. Enforced during generation, so the model cannot return
+# a shape act.py is not ready to read -- same discipline as extract.py.
 FIX_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -191,7 +190,7 @@ def _build_prompt(request: FixRequest) -> str:
 
 
 class FixGenerator:
-    """Picks the best available backend once, then reports honestly which it is.
+    """The code model, or an honest refusal to draft anything.
 
     Constructed per call in act.py rather than held on the engine, so flipping a
     credential in `.env` and re-running picks the new backend up without a
@@ -199,27 +198,15 @@ class FixGenerator:
     """
 
     def __init__(self) -> None:
-        self.pipeshift_available = bool(config.PIPESHIFT_API_KEY)
-        self.claude_available = bool(config.ANTHROPIC_API_KEY)
-
-        if self.pipeshift_available:
-            self.backend = "pipeshift"
-            self.model = config.PIPESHIFT_CODE_MODEL
-        elif self.claude_available:
-            self.backend = "anthropic-fallback"
-            self.model = config.CODING_AGENT_MODEL
-        else:
-            self.backend = "none"
-            self.model = ""
+        self.available = bool(config.ANTHROPIC_API_KEY)
+        self.backend = "anthropic" if self.available else "none"
+        self.model = config.CODING_AGENT_MODEL if self.available else ""
 
         self._client = None
-        if self.pipeshift_available:
-            from openai import OpenAI
+        if self.available:
+            import anthropic
 
-            self._client = OpenAI(
-                api_key=config.PIPESHIFT_API_KEY,
-                base_url=config.PIPESHIFT_BASE_URL,
-            )
+            self._client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
     # -- public ---------------------------------------------------------------
 
@@ -227,13 +214,12 @@ class FixGenerator:
         started = time.perf_counter()
         targeted = bool(request.regression_evidence)
 
-        if self.backend == "none":
+        if not self.available:
             return FixProposal(
                 diff=None,
                 explanation=(
-                    "No code-generation credential is configured (neither "
-                    "PIPESHIFT_API_KEY nor ANTHROPIC_API_KEY), so no patch was "
-                    "drafted. Nothing was guessed in its place."
+                    "ANTHROPIC_API_KEY is not configured, so no patch was drafted. "
+                    "Nothing was guessed in its place."
                 ),
                 confidence=None,
                 backend="none",
@@ -243,22 +229,24 @@ class FixGenerator:
             )
 
         try:
-            if self.backend == "pipeshift":
-                proposal = self._generate_pipeshift(request)
-            else:
-                proposal = self._generate_claude(request)
+            proposal = self._generate(request)
         except Exception as exc:
-            # A failed call is reported as a failed call. It does not silently
-            # fall through to the other backend, because a demo that quietly
-            # switched models would misrepresent which model produced the patch.
+            # A failed call is reported as a failed call. There is nothing to
+            # silently fall through to, and inventing one would misrepresent
+            # which model produced the patch.
+            #
+            # The model id is in the reason on purpose: the most likely cause is
+            # a CODING_AGENT_MODEL pointing at a model this account cannot
+            # reach, and "code model call failed" sends someone debugging the
+            # network instead of reading one line of .env.
             return FixProposal(
                 diff=None,
-                explanation=f"The {self.backend} fix generator failed and no patch was produced.",
+                explanation="The fix generator failed and no patch was produced.",
                 confidence=None,
                 backend=self.backend,
                 model=self.model,
                 degraded=True,
-                degraded_reason=f"{self.backend} call failed",
+                degraded_reason=f"call to {self.model!r} failed ({type(exc).__name__})",
                 targeted=targeted,
                 error=str(exc)[:300],
                 latency_ms=round((time.perf_counter() - started) * 1000, 1),
@@ -270,129 +258,91 @@ class FixGenerator:
 
     # -- the graded path ------------------------------------------------------
 
-    def _generate_pipeshift(self, request: FixRequest) -> FixProposal:
-        resp = self._client.chat.completions.create(
-            model=config.PIPESHIFT_CODE_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_prompt(request)},
-            ],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "fix_proposal",
-                    "strict": True,
-                    "schema": FIX_SCHEMA,
-                },
-            },
-            temperature=0,
+    def _generate(self, request: FixRequest) -> FixProposal:
+        """A constrained decode on the code model.
+
+        No `temperature`: the model rejects sampling parameters outright. Depth
+        is controlled by `effort` instead, which is the parameter that actually
+        exists on this model.
+        """
+        resp = self._client.messages.create(
+            model=config.CODING_AGENT_MODEL,
             max_tokens=config.CODING_AGENT_MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": _build_prompt(request)}],
+            output_config={
+                "effort": config.CODING_AGENT_EFFORT,
+                "format": {"type": "json_schema", "schema": FIX_SCHEMA},
+            },
         )
-        payload = json.loads(resp.choices[0].message.content)
+
         usage = getattr(resp, "usage", None)
-        return _proposal_from_payload(
-            payload,
-            backend="pipeshift",
-            model=config.PIPESHIFT_CODE_MODEL,
-            degraded=False,
-            degraded_reason="",
-            usage={
-                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
-                "completion_tokens": getattr(usage, "completion_tokens", 0),
+        usage_dict = (
+            {
+                "prompt_tokens": getattr(usage, "input_tokens", 0),
+                "completion_tokens": getattr(usage, "output_tokens", 0),
             }
             if usage
-            else {},
+            else {}
         )
 
-    # -- the degraded path ----------------------------------------------------
-
-    def _generate_claude(self, request: FixRequest) -> FixProposal:
-        """A general coding model, used only when Pipeshift is not configured.
-
-        Explicitly not the graded model step. Every proposal from here carries
-        `degraded=True` and a reason, which act.py copies onto the PR metadata
-        and the UI renders, so nobody reading the output can mistake this for
-        the specialised code model.
-        """
-        instruction = (
-            f"{SYSTEM_PROMPT}\n\n"
-            "Reply with a single JSON object and no prose around it, with keys: "
-            '"diff" (string), "explanation" (string), "confidence" (number 0-1), '
-            '"files_touched" (array of strings).'
-        )
-        resp = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": config.ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": config.CODING_AGENT_MODEL,
-                "max_tokens": config.CODING_AGENT_MAX_TOKENS,
-                "system": instruction,
-                "messages": [{"role": "user", "content": _build_prompt(request)}],
-            },
-            timeout=90.0,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        text = "".join(block.get("text", "") for block in body.get("content", []))
-        payload = _loads_lenient(text)
-        usage = body.get("usage") or {}
-
-        reason = (
-            "PIPESHIFT_API_KEY is not set, so this patch came from a general "
-            "coding model, not the specialised DeepSeek Coder deployment"
-        )
-        if payload is None:
-            # The fallback has no schema enforcement, so an unparseable answer is
-            # a real possibility. Report it rather than regex a diff out of prose.
+        # Two ways to get back something that is not a patch. Both are reported
+        # as "no patch", never as a partial one: a truncated diff looks like a
+        # real diff to a reviewer, which is the one outcome this module exists
+        # to prevent.
+        if resp.stop_reason == "refusal":
             return FixProposal(
                 diff=None,
                 explanation=(
-                    "The fallback coding model did not return the requested JSON "
-                    "shape, so no patch was accepted."
+                    "The model's safety classifiers declined this request, so no patch "
+                    "was drafted."
                 ),
                 confidence=None,
-                backend="anthropic-fallback",
-                model=config.CODING_AGENT_MODEL,
+                backend=self.backend,
+                model=self.model,
                 degraded=True,
-                degraded_reason=reason,
-                error="fallback response was not valid JSON",
+                degraded_reason="refused by the code model's safety classifiers",
+                usage=usage_dict,
+                error="stop_reason=refusal",
+            )
+
+        text = next((b.text for b in resp.content if b.type == "text"), "")
+        try:
+            payload = json.loads(text)
+        except Exception:
+            truncated = resp.stop_reason == "max_tokens"
+            return FixProposal(
+                diff=None,
+                explanation=(
+                    "The patch did not fit in the token budget and was cut off, so it "
+                    "was discarded rather than shown half-written."
+                    if truncated
+                    else "The code model did not return a readable patch, so none was accepted."
+                ),
+                confidence=None,
+                backend=self.backend,
+                model=self.model,
+                degraded=True,
+                degraded_reason=(
+                    "response hit max_tokens; raise CODING_AGENT_MAX_TOKENS"
+                    if truncated
+                    else "response was not valid JSON"
+                ),
+                usage=usage_dict,
+                error=f"stop_reason={resp.stop_reason}",
             )
 
         return _proposal_from_payload(
             payload,
-            backend="anthropic-fallback",
-            model=config.CODING_AGENT_MODEL,
-            degraded=True,
-            degraded_reason=reason,
-            usage={
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-            },
+            backend=self.backend,
+            model=self.model,
+            degraded=False,
+            degraded_reason="",
+            usage=usage_dict,
         )
 
 
 # --- shared parsing -----------------------------------------------------------
-
-
-def _loads_lenient(text: str) -> Optional[dict[str, Any]]:
-    """Parse JSON that may be wrapped in a fenced block. Never guesses content."""
-    candidate = text.strip()
-    if candidate.startswith("```"):
-        candidate = candidate.split("```")[1] if "```" in candidate[3:] else candidate[3:]
-        if candidate.lstrip().lower().startswith("json"):
-            candidate = candidate.lstrip()[len("json"):]
-    start, end = candidate.find("{"), candidate.rfind("}")
-    if start < 0 or end < start:
-        return None
-    try:
-        parsed = json.loads(candidate[start : end + 1])
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
 
 
 def _proposal_from_payload(
