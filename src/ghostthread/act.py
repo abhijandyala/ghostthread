@@ -1,21 +1,23 @@
 """What GhostThread actually does about a leak.
 
-The policy branch is entirely a function of the intent profile and the extracted
-facts. Nothing here decides on its own authority:
+This module executes a `RoutingDecision`; it does not make one. Every branch
+below asks "did the router permit this action", never "what category is this".
+The router in turn asks only what the InsForge policy allows. That chain is what
+makes the no-hardcoded-logic claim true: change the policy row, change what
+happens, without touching code.
 
-  severity >= risk_threshold                  -> escalate to a human, always
-  is_code_issue and auto_fix_allowed
-      and severity <= auto_fix_max_severity   -> attempt a sandboxed fix
-  otherwise                                   -> file and reply
+Three things are hardcoded here on purpose, and only three:
 
-Every write is gated behind DRY_RUN, which defaults to on. In dry run we compute
-and return the exact payload we would have sent, so the demo shows real intent
-without emailing a stranger.
+  * the sandbox repo allowlist is *checked* (its contents come from the profile)
+  * a pull request is never auto-merged
+  * every write is gated behind DRY_RUN, which defaults to on
+
+In dry run we compute and return the exact payload we would have sent, so the
+demo shows real intent without emailing a stranger.
 """
 
 from __future__ import annotations
 
-import json
 import subprocess
 import time
 from pathlib import Path
@@ -24,17 +26,27 @@ from typing import Any, Optional
 import httpx
 
 from . import config, google_auth
-from .contracts import ExtractedFacts, IntentProfile, LeakResult, ResolutionAction
+from .contracts import (
+    ExtractedFacts,
+    IntentProfile,
+    LeakResult,
+    MemoryReadResult,
+    ResolutionAction,
+    RoutingDecision,
+)
 
 TICKET_OWNER = "GhostThread"
 
-
-def decide(facts: ExtractedFacts, profile: IntentProfile) -> str:
-    if facts.severity >= profile.risk_threshold:
-        return "escalate"
-    if facts.is_code_issue and profile.auto_fix_allowed and facts.severity <= profile.auto_fix_max_severity:
-        return "auto_fix"
-    return "track_and_reply"
+# Action names, not category names. Dispatching on what the policy *permitted*
+# is the whole point; dispatching on the category would bypass the policy.
+TICKET_ACTIONS = frozenset(
+    {"file_ticket", "file_ticket_tagged_feature", "file_ticket_internal"}
+)
+LINK_ACTION = "link_existing_ticket"
+FIX_ACTION = "propose_sandbox_fix"
+REPLY_ACTION = "reply"
+ESCALATE_ACTION = "escalate"
+LOG_ONLY_ACTION = "log_only"
 
 
 # --- Linear ------------------------------------------------------------------
@@ -46,7 +58,39 @@ mutation IssueCreate($input: IssueCreateInput!) {
 """
 
 
-def create_ticket(leak: LeakResult, facts: ExtractedFacts, profile: IntentProfile) -> tuple[Optional[str], dict[str, Any]]:
+def _memory_section(memory: Optional[MemoryReadResult]) -> list[str]:
+    """The history block in the ticket body. This is the visible payoff.
+
+    Absent memory is stated as absent rather than omitted, so a reader can tell
+    "first time we have heard this" apart from "we did not look".
+    """
+    if memory is None:
+        return ["**History:** not consulted."]
+    if not memory.has_history:
+        return ["**History:** no prior contact from this reporter on this topic."]
+
+    lines = [
+        "**History (from memory, across every connected source):**",
+        f"- This reporter has raised {memory.times_reported_by_actor} prior report(s).",
+        f"- This topic has been seen {memory.times_seen_on_topic} time(s) across all reporters.",
+    ]
+    for prior in memory.prior_resolutions:
+        lines.append(f"- Previously resolved: {prior.summary} ({prior.ticket_url})")
+    if memory.likely_regression:
+        lines.append(
+            f"- Implicated by history: {memory.likely_regression.source} "
+            f"{memory.likely_regression.ref} {memory.likely_regression.url}".rstrip()
+        )
+    return lines
+
+
+def create_ticket(
+    leak: LeakResult,
+    facts: ExtractedFacts,
+    profile: IntentProfile,
+    decision: RoutingDecision,
+    memory: Optional[MemoryReadResult] = None,
+) -> tuple[Optional[str], dict[str, Any]]:
     complaint = leak.complaint
     title = facts.what_broke[:120]
     body = "\n".join(
@@ -56,13 +100,21 @@ def create_ticket(leak: LeakResult, facts: ExtractedFacts, profile: IntentProfil
             f"**Source:** {complaint['source']} in `{complaint['channel_or_thread']}`",
             f"**Reported by:** {complaint['author_email']}",
             f"**Age at detection:** {leak.age_hours:.0f}h",
-            f"**Severity (extracted):** {facts.severity:.2f}",
+            f"**Category:** {decision.category} (confidence {facts.confidence:.2f})",
+            f"**Severity (extracted):** {facts.severity:.2f} "
+            f"({profile.severity_band(facts.severity)})",
             f"**Component hint:** {facts.file_hint or 'unknown'}",
-            f"**Leak confidence:** {leak.confidence:.2f} (best match scored {leak.score:.2f} against a threshold of {leak.threshold:.2f})",
+            f"**Leak confidence:** {leak.confidence:.2f} (best match scored "
+            f"{leak.score:.2f} against a threshold of {leak.threshold:.2f})",
+            f"**Sources consulted:** {', '.join(leak.sources_used) or 'none'}",
+            f"**Sources out of scope:** {', '.join(leak.sources_missing) or 'none'}",
+            "",
+            *_memory_section(memory),
             "",
             "> " + complaint["text"].replace("\n", "\n> "),
             "",
-            f"Escalation contact: {profile.escalation_contact}",
+            f"Routing: {decision.reason}",
+            f"Escalation contact: {decision.escalation_contact or profile.escalation_contact}",
         ]
     )
     payload = {"title": title, "description": body, "teamId": config.LINEAR_TEAM_ID}
@@ -94,43 +146,106 @@ def _ensure_sandbox() -> Path:
     return root
 
 
-def attempt_fix(facts: ExtractedFacts, ticket_id: Optional[str]) -> tuple[bool, Optional[str], dict[str, Any]]:
+def allowlist_check(profile: IntentProfile) -> tuple[bool, str]:
+    """The one hardcoded safety rule: never touch a repo not on the allowlist.
+
+    The *contents* of the allowlist are policy and live in the profile. The fact
+    that it is consulted at all is not negotiable and does not live in the
+    profile, because a policy that can switch off its own safety check is not a
+    safety check.
+    """
+    allowed = profile.sandbox_repo_allowlist
+    if not allowed:
+        return False, "sandbox_repo_allowlist is empty; refusing to touch any repo"
+    target = config.GITHUB_REPO
+    if not target:
+        # No real repo configured: the agent works only in the local disposable
+        # sandbox, which is the safe default rather than a failure.
+        return True, f"local sandbox only; allowlist holds {len(allowed)} repo(s)"
+    if target not in allowed:
+        return False, f"{target} is not on the sandbox allowlist {allowed}"
+    return True, f"{target} is on the sandbox allowlist"
+
+
+def attempt_fix(
+    facts: ExtractedFacts,
+    profile: IntentProfile,
+    ticket_id: Optional[str],
+    memory: Optional[MemoryReadResult] = None,
+) -> tuple[bool, Optional[str], dict[str, Any]]:
     """Ask a coding model for a minimal patch inside the sandbox repo."""
+    permitted, why = allowlist_check(profile)
+    if not permitted:
+        return False, None, {"blocked": why}
+
     root = _ensure_sandbox()
     if not config.ANTHROPIC_API_KEY:
-        return False, None, {"skipped": "ANTHROPIC_API_KEY not configured"}
+        return False, None, {"skipped": "ANTHROPIC_API_KEY not configured", "allowlist": why}
 
+    # Regression evidence from the memory read is what turns a broad search into
+    # a targeted one. Without it the model is guessing at which file to open,
+    # and the PR says so rather than pretending otherwise.
     target = facts.file_hint or "unknown_component"
-    prompt = (
-        "You are fixing a single, small, well-scoped bug in a Python service.\n"
-        f"Reported problem: {facts.what_broke}\n"
-        f"Suspected component: {target}\n\n"
-        "Return a unified diff and nothing else. Keep the change minimal. "
-        "If you cannot determine the fix with confidence, return the single word SKIP."
+    scope_lines = []
+    if facts.regression_evidence:
+        scope_lines.append(
+            f"History implicates {facts.regression_evidence} in this regression. "
+            f"Start there."
+        )
+    else:
+        scope_lines.append(
+            "No regression evidence is available, so the target is a guess. "
+            "Prefer the smallest plausible change and say if you are unsure."
+        )
+    if memory is not None and memory.prior_resolutions:
+        scope_lines.append(
+            f"This topic has been resolved {len(memory.prior_resolutions)} time(s) "
+            f"before; a recurrence suggests the earlier fix was incomplete."
+        )
+
+    prompt = "\n".join(
+        [
+            "You are fixing a single, small, well-scoped bug in a Python service.",
+            f"Reported problem: {facts.what_broke}",
+            f"Suspected component: {target}",
+            *scope_lines,
+            "",
+            "Return a unified diff and nothing else. Keep the change minimal. "
+            "If you cannot determine the fix with confidence, return the single word SKIP.",
+        ]
     )
 
     try:
         diff = _call_coding_model(prompt)
     except Exception as exc:
-        return False, None, {"error": str(exc)}
+        return False, None, {"error": str(exc), "allowlist": why}
 
     if not diff or diff.strip() == "SKIP":
-        return False, None, {"result": "model declined to patch"}
+        return False, None, {"result": "model declined to patch", "allowlist": why}
 
     branch = f"ghostthread/{(ticket_id or facts.complaint_id).lower()}"
     patch_path = root / f"{branch.replace('/', '_')}.patch"
     patch_path.write_text(diff, encoding="utf-8")
 
+    meta = {
+        "branch": branch,
+        "diff": diff,
+        "allowlist": why,
+        "targeted": bool(facts.regression_evidence),
+        "regression_evidence": facts.regression_evidence,
+        "never_automerge": profile.never_automerge,
+    }
+
     if config.DRY_RUN:
-        return True, None, {"dry_run": True, "branch": branch, "patch_file": str(patch_path), "diff": diff}
+        return True, None, {**meta, "dry_run": True, "patch_file": str(patch_path)}
 
     subprocess.run(["git", "checkout", "-B", branch], cwd=root, check=False)
     applied = subprocess.run(["git", "apply", str(patch_path)], cwd=root, capture_output=True)
     if applied.returncode != 0:
-        return False, None, {"error": applied.stderr.decode()[:500], "diff": diff}
+        return False, None, {**meta, "error": applied.stderr.decode()[:500]}
     subprocess.run(["git", "add", "-A"], cwd=root, check=False)
     subprocess.run(["git", "commit", "-qm", f"fix: {facts.what_broke[:60]}"], cwd=root, check=False)
-    return True, f"sandbox://{root.name}/{branch}", {"branch": branch, "diff": diff}
+    return True, f"sandbox://{root.name}/{branch}", meta
 
 
 def _call_coding_model(prompt: str) -> str:
@@ -154,31 +269,75 @@ def _call_coding_model(prompt: str) -> str:
 
 
 # --- replying to the human who reported it -----------------------------------
+# Three tones, selected by what the memory read returned. The tone is not
+# decoration: an escalation reply that opens with "thanks for getting in touch"
+# to someone on their third report is the exact failure the memory prevents.
+
+
+def _opening(tone: str, who: str, memory: Optional[MemoryReadResult]) -> list[str]:
+    seen = memory.times_reported_by_actor if memory else 0
+
+    if tone == "escalation":
+        return [
+            f"Hi {who},",
+            "",
+            f"You have now reported this {seen} times, and it should not have taken "
+            f"that many. That is on us.",
+        ]
+    if tone == "returning":
+        return [
+            f"Hi {who},",
+            "",
+            "You have raised this with us before, so I will skip the introductions.",
+        ]
+    return [
+        f"Hi {who},",
+        "",
+        "Thanks for flagging this.",
+    ]
 
 
 def compose_reply(
     leak: LeakResult,
     facts: ExtractedFacts,
     ticket_id: Optional[str],
-    decision: str,
+    decision: RoutingDecision,
     fix_attempted: bool,
+    memory: Optional[MemoryReadResult] = None,
 ) -> str:
+    """Grounded only in retrieved facts. Never invents a ticket status."""
     complaint = leak.complaint
     who = complaint["author_email"].split("@")[0]
-    lines = [
-        f"Hi {who},",
+
+    lines = _opening(facts.reply_tone, who, memory)
+    lines += [
         "",
-        f"Following up on what you reported {leak.age_hours:.0f} hours ago: \"{facts.what_broke}\"",
+        f"On what you reported {leak.age_hours:.0f} hours ago: \"{facts.what_broke}\"",
         "",
-        "This had not been captured as tracked work anywhere, so it was at risk of being lost. "
-        f"It is now filed as {ticket_id or 'a new ticket'} and owned by the {TICKET_OWNER} queue.",
+        "This had not been captured as tracked work anywhere, so it was at risk of "
+        f"being lost. It is now filed as {ticket_id or 'a new ticket'} and owned by "
+        f"the {TICKET_OWNER} queue.",
     ]
+
+    if memory is not None and memory.prior_resolutions:
+        lines += [
+            "",
+            f"I can see {len(memory.prior_resolutions)} earlier resolution(s) on this "
+            "topic. Since it has come back, we are treating the previous fix as "
+            "incomplete rather than reopening the same ground.",
+        ]
+
     if fix_attempted:
-        lines.append("A candidate fix has been drafted and is waiting on review.")
-    elif decision == "auto_fix":
-        lines.append("It is queued for an automated fix attempt.")
-    elif decision == "escalate":
-        lines.append("Given the impact, it has also been escalated to a human on-call engineer.")
+        if facts.regression_evidence:
+            lines.append(
+                f"\nA candidate fix is drafted and waiting on review. History pointed "
+                f"us at {facts.regression_evidence}, so it targets that directly."
+            )
+        else:
+            lines.append("\nA candidate fix has been drafted and is waiting on review.")
+    elif ESCALATE_ACTION in decision.actions:
+        lines.append("\nGiven the impact, it has also been escalated to a human on-call engineer.")
+
     lines += ["", "You will get an update on this thread when it moves.", "", "— GhostThread"]
     return "\n".join(lines)
 
@@ -221,30 +380,110 @@ def send_reply(leak: LeakResult, body: str) -> tuple[bool, Optional[str], dict[s
     return False, channel, {"error": f"no write credentials for {source}"}
 
 
-def resolve(leak: LeakResult, facts: ExtractedFacts, profile: IntentProfile) -> ResolutionAction:
-    decision = decide(facts, profile)
-    ticket_id, ticket_meta = create_ticket(leak, facts, profile)
+# --- escalation ---------------------------------------------------------------
+
+
+def escalate(
+    leak: LeakResult, facts: ExtractedFacts, decision: RoutingDecision
+) -> dict[str, Any]:
+    """Hand to a human. In dry run this is the payload that would be paged."""
+    return {
+        "dry_run": config.DRY_RUN,
+        "contact": decision.escalation_contact,
+        "complaint_id": facts.complaint_id,
+        "category": decision.category,
+        "severity": facts.severity,
+        "urgency": facts.urgency,
+        "why": decision.reason,
+        "summary": facts.what_broke,
+        "requires_human_approval": decision.requires_human_approval,
+    }
+
+
+# --- execution ----------------------------------------------------------------
+
+
+def resolve(
+    leak: LeakResult,
+    facts: ExtractedFacts,
+    profile: IntentProfile,
+    decision: RoutingDecision,
+    memory: Optional[MemoryReadResult] = None,
+) -> ResolutionAction:
+    """Execute exactly the actions the router permitted. Nothing more.
+
+    Note what is absent: there is no `if category == ...` anywhere below, and no
+    action is taken that is not in `decision.actions`. An action the policy did
+    not grant cannot happen here even by accident, because there is no code path
+    that reaches it.
+    """
+    started = time.perf_counter()
+    permitted = set(decision.actions)
+    meta: dict[str, Any] = {"permitted": sorted(permitted)}
+    performed: list[str] = []
+
+    ticket_id: Optional[str] = None
+    ticket_url: Optional[str] = None
+    if permitted & TICKET_ACTIONS:
+        ticket_id, ticket_meta = create_ticket(leak, facts, profile, decision, memory)
+        ticket_url = ticket_meta.get("url")
+        meta["ticket"] = ticket_meta
+        performed.extend(sorted(permitted & TICKET_ACTIONS))
+
+    if LINK_ACTION in permitted:
+        meta["link"] = {
+            "existing_ticket": facts.references_existing_ticket,
+            "linked": bool(facts.references_existing_ticket),
+            # The classifier is told never to invent a ticket id, so an absent
+            # one means the message genuinely named none.
+            "note": "no ticket referenced in the message"
+            if not facts.references_existing_ticket
+            else "",
+        }
+        performed.append(LINK_ACTION)
 
     fix_attempted, fix_url = False, None
-    fix_meta: dict[str, Any] = {}
-    if decision == "auto_fix":
-        fix_attempted, fix_url, fix_meta = attempt_fix(facts, ticket_id)
+    if FIX_ACTION in permitted:
+        fix_attempted, fix_url, fix_meta = attempt_fix(facts, profile, ticket_id, memory)
+        meta["fix"] = fix_meta
+        if fix_attempted:
+            performed.append(FIX_ACTION)
 
     reply_sent, reply_channel = False, None
-    reply_meta: dict[str, Any] = {}
-    if profile.auto_reply_allowed:
-        body = compose_reply(leak, facts, ticket_id, decision, fix_attempted)
+    if REPLY_ACTION in permitted:
+        body = compose_reply(leak, facts, ticket_id, decision, fix_attempted, memory)
         reply_sent, reply_channel, reply_meta = send_reply(leak, body)
+        meta["reply"] = {**reply_meta, "tone": facts.reply_tone}
+        performed.append(REPLY_ACTION)
+
+    escalated = False
+    if ESCALATE_ACTION in permitted:
+        meta["escalation"] = escalate(leak, facts, decision)
+        escalated = True
+        performed.append(ESCALATE_ACTION)
+
+    if LOG_ONLY_ACTION in permitted:
+        performed.append(LOG_ONLY_ACTION)
+
+    if not permitted:
+        meta["no_action"] = f"policy for {decision.category} permits no actions"
 
     return ResolutionAction(
         leak=leak.to_dict(),
         facts=facts.to_dict(),
         ticket_created_id=ticket_id,
+        ticket_url=ticket_url,
         fix_attempted=fix_attempted,
         fix_pr_url=fix_url,
         reply_sent=reply_sent,
         reply_channel=reply_channel,
-        decision=decision,
+        decision=decision.reason,
         dry_run=config.DRY_RUN,
-        meta={"ticket": ticket_meta, "fix": fix_meta, "reply": reply_meta},
+        meta=meta,
+        actions_taken=performed,
+        escalated=escalated,
+        routing=decision.to_dict(),
+        memory=memory.to_dict() if memory else {},
+        cost_usd=facts.cost_usd,
+        latency_ms=round((time.perf_counter() - started) * 1000, 1),
     )

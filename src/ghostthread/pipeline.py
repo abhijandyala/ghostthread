@@ -133,12 +133,14 @@ def node_act(
     facts: ExtractedFacts,
     decision: RoutingDecision,
     profile: IntentProfile,
+    recalled: MemoryReadResult,
 ) -> ResolutionAction:
-    """N6. Ticket, sandboxed fix, reply, escalate -- all behind DRY_RUN."""
-    resolution = act.resolve(leak, facts, profile)
-    resolution.routing = decision.to_dict()
-    resolution.actions_taken = list(decision.actions)
-    resolution.escalated = router.ESCALATE_ACTION in decision.actions
+    """N6. Ticket, sandboxed fix, reply, escalate -- all behind DRY_RUN.
+
+    `act.resolve` executes the decision rather than making one: it performs
+    exactly the actions in `decision.actions` and has no path to any other.
+    """
+    resolution = act.resolve(leak, facts, profile, decision, recalled)
     resolution.timestamp = _now_iso()
     return resolution
 
@@ -260,8 +262,7 @@ class GhostThread:
         recalled = node_memory_read(complaint, scope, profile, self.grounding)
         facts = node_classify(complaint, recalled, profile, self.extractor)
         decision = node_route(facts, profile)
-        resolution = node_act(leak, facts, decision, profile)
-        resolution.memory = recalled.to_dict()
+        resolution = node_act(leak, facts, decision, profile, recalled)
         resolution.memory_write_id = node_memory_write(
             complaint, facts, decision, resolution, self.grounding
         )
