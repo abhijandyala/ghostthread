@@ -26,12 +26,16 @@ assuming either is wrong.
 Two people build in parallel on separate branches. A file belongs to exactly one
 track. Cross-track edits are the single most likely way this build fails.
 
-- **Track A** (HydraDB): `hydra.py`, `leaks.py`, `killshot.py`, `resolve.py`,
-  `memory.py`
+- **Track A** (HydraDB): `hydra.py`, `leaks.py`, `knowledge_query.py`,
+  `killshot.py`, `resolve.py`, `memory.py`, `eval_suite.py`
 - **Track B** (everything else): `extract.py`, `act.py`, `router.py`,
   `intent.py`, `pipeline.py`, `api.py`, `web/`, `rocketride/`, `insforge/`,
   `scripts/`
 - **Joint, sync points only**: `contracts.py`
+
+Node N1/N7 (`memory_read`, `memory_write`) live inside `memory.py`, and N2 lives
+in `knowledge_query.py` — both Track A. `pipeline.py` merely calls them, so
+filling a stub never requires touching Track B's file.
 
 If a task requires touching the other track's file, that is a finding to report,
 not a thing to work around. Say which file, which track owns it, and what the
@@ -48,9 +52,25 @@ Order work by what unblocks the most people and what fails hardest if left late:
 4. Feature work
 5. Polish
 
-Prefer delegating: `coder` for a scoped implementation, `qa-tester` for
-functional verification, `merge-warden` for branch/PR/integrity state. Give each
-one a single, unambiguous objective and the file it owns.
+Prefer delegating, and give each one a single unambiguous objective plus the
+files it may touch:
+
+| agent | for | acts? |
+|---|---|---|
+| `coder` | one scoped implementation in named files | edits code |
+| `issue-checker` | static review: defects, contract drift, dead paths | reports |
+| `qa-tester` | functional verification: runs the suite and the kill shot | reports |
+| `merge-warden` | is this branch safe to merge | reports |
+| `git-operator` | branch, commit, push, PR, merge | acts on git |
+
+The order that catches the most for the least time is: `coder` implements,
+`issue-checker` reads it, `qa-tester` runs it, `merge-warden` gates it,
+`git-operator` ships it. Skipping straight from coder to git-operator is how an
+unverified branch reaches `main`.
+
+Each agent appends a dated entry to its own log under `docs/agentlog/`. Read the
+relevant log before delegating — it is how you avoid re-litigating a decision
+someone already made.
 
 ## Reporting
 

@@ -5,3 +5,4 @@ __pycache__/
 sandbox_repo/
 .DS_Store
 .rocketride/
+node_modules/

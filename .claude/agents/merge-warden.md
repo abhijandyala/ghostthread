@@ -25,7 +25,8 @@ Name the files.
 edit is a merge conflict waiting to happen. Diff the branch against `main`
 (`git diff --stat main...HEAD`) and flag any file edited by the wrong track:
 
-- **Track A** owns `hydra.py`, `leaks.py`, `killshot.py`, `resolve.py`, `memory.py`
+- **Track A** owns `hydra.py`, `leaks.py`, `knowledge_query.py`, `killshot.py`,
+  `resolve.py`, `memory.py`, `eval_suite.py`
 - **Track B** owns `extract.py`, `act.py`, `router.py`, `intent.py`,
   `pipeline.py`, `api.py`, `web/`, `rocketride/`, `insforge/`, `scripts/`
 - `contracts.py` is joint and may only change at a sync point
