@@ -141,12 +141,24 @@ class Extractor:
     )
 
     def _classify_heuristic(self, text: str) -> tuple[str, float]:
-        """Returns (category, confidence). Confidence tracks how many cues hit."""
+        """Returns (category, confidence). Confidence tracks how many cues hit.
+
+        Every category is scored and the strongest wins. Returning the first
+        category with any hit made declaration order the classifier: a message
+        saying the new export is great but the API returns an error scored one
+        hit for praise and three for a bug, and was filed as praise. Ties still
+        fall to the earlier entry, so the ordering above remains the tiebreak --
+        it is just no longer the whole decision.
+        """
+        best_category = FALLBACK_CATEGORY
+        best_hits = 0
         for category, cues in self._CATEGORY_CUES:
             hits = sum(1 for cue in cues if cue in text)
-            if hits:
-                return category, round(min(1.0, 0.55 + 0.15 * hits), 3)
-        return FALLBACK_CATEGORY, 0.3
+            if hits > best_hits:
+                best_category, best_hits = category, hits
+        if not best_hits:
+            return FALLBACK_CATEGORY, 0.3
+        return best_category, round(min(1.0, 0.55 + 0.15 * best_hits), 3)
 
     def _extract_heuristic(self, complaint: ComplaintEvent) -> ExtractedFacts:
         text = complaint.text.lower()

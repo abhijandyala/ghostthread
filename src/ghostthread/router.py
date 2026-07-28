@@ -17,6 +17,11 @@ Two rules this file exists to enforce:
    with no policy is a configuration bug and should fail loudly at startup, not
    silently grant or deny actions at runtime.
 
+3. **The router only ever subtracts.** Gates here remove actions the policy
+   granted and can raise the approval requirement; they never add an action the
+   policy withheld. A rule that needs to grant something belongs in the profile,
+   as an opt-in flag the policy sets (see `escalate_on_risk`).
+
 Every threshold comes from the intent profile. `scripts/verify_no_hardcoding.py`
 runs an AST pass over this file and fails the build on any comparison against a
 numeric literal.
@@ -79,13 +84,33 @@ def route(facts: ExtractedFacts, profile: IntentProfile) -> RoutingDecision:
     # Severity above the risk threshold always reaches a human, whatever the
     # category's own policy says. This is a floor on caution, not a category
     # rule, which is why it is applied after the policy rather than inside it.
+    #
+    # The floor raises *approval*, not *authority*. Requiring a human is a
+    # restriction the router may always impose; handing out the escalate action
+    # would be granting a capability, and the router grants nothing the policy
+    # did not. A category the profile deliberately gives no actions at all (spam
+    # being the obvious one) must not acquire one by being scored severe.
     escalated_by_risk = facts.severity >= profile.risk_threshold
-    if escalated_by_risk and ESCALATE_ACTION not in actions:
-        actions.append(ESCALATE_ACTION)
-        reasons.append(
-            f"severity {facts.severity:.2f} at or above risk threshold "
-            f"{profile.risk_threshold:.2f}, escalating"
+    if escalated_by_risk:
+        may_escalate = ESCALATE_ACTION in policy.get("allowed_actions", []) or bool(
+            policy.get("escalate_on_risk", False)
         )
+        if may_escalate:
+            if ESCALATE_ACTION not in actions:
+                actions.append(ESCALATE_ACTION)
+            reasons.append(
+                f"severity {facts.severity:.2f} at or above risk threshold "
+                f"{profile.risk_threshold:.2f}, escalating"
+            )
+        else:
+            # Say so rather than dropping it silently: "risk was seen and the
+            # policy declined to escalate" is a reviewable statement, and the
+            # human-approval flag below still holds the line.
+            reasons.append(
+                f"severity {facts.severity:.2f} at or above risk threshold "
+                f"{profile.risk_threshold:.2f}, but the policy for {category} does "
+                f"not permit escalation; held for human approval instead"
+            )
 
     requires_approval = bool(policy.get("requires_human_approval", False))
     if escalated_by_risk:

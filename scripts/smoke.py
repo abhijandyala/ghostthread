@@ -91,11 +91,21 @@ def check_reply_tone_ladder() -> list[str]:
     if not thresholds:
         return ["reply_tone_thresholds missing from the profile; the tone ladder is dead"]
 
-    escalation_at = thresholds.get("escalation", 3)
+    # No defaults here on purpose. A `.get(key, 3)` in the check that exists to
+    # prove nothing is hardcoded would let the profile lose a step point and
+    # still pass, against a number this file made up.
+    missing = [key for key in ("returning", "escalation") if key not in thresholds]
+    if missing:
+        return [
+            f"reply_tone_thresholds is missing {', '.join(missing)}; "
+            f"the step points must come from the profile and this check "
+            f"will not substitute a default for them"
+        ]
+
     cases = [
         (0, "first_contact"),
-        (thresholds.get("returning", 1), "returning"),
-        (escalation_at, "escalation"),
+        (thresholds["returning"], "returning"),
+        (thresholds["escalation"], "escalation"),
     ]
     problems = []
     for count, expected in cases:
@@ -133,20 +143,36 @@ def check_pipeline_runs() -> tuple[list[str], object]:
     return problems, report
 
 
-def check_idempotency(engine_report) -> list[str]:
-    """The same complaint filed twice must produce one ticket, not two."""
+def check_idempotency() -> list[str]:
+    """The same complaint filed twice must produce one ticket, not two.
+
+    Both halves are asserted. "The second run added nothing" is satisfied by a
+    pipeline that does nothing at all, so the first run must be shown to have
+    acted before its silence on the second run means anything.
+    """
     engine = GhostThread()
     first = engine.run(act_on_leaks=True)
     second = engine.run(act_on_leaks=True)
 
     real_first = [a for a in first.actions if not a.get("idempotent_replay")]
     real_second = [a for a in second.actions if not a.get("idempotent_replay")]
-    if real_first and real_second:
-        return [
+    replays = [a for a in second.actions if a.get("idempotent_replay")]
+
+    problems = []
+    if not real_first:
+        problems.append(
+            "first run produced no fresh actions, so the replay was never exercised"
+        )
+    if real_second:
+        problems.append(
             f"second run produced {len(real_second)} fresh actions; "
             f"idempotency log did not catch the replay"
-        ]
-    return []
+        )
+    elif not replays:
+        problems.append(
+            "second run recorded no replays; the idempotency log was not consulted"
+        )
+    return problems
 
 
 def main() -> int:
@@ -165,7 +191,7 @@ def main() -> int:
         ("low confidence collapses to the fallback", check_low_confidence_collapses()),
         ("reply tone ladder steps with the counts", check_reply_tone_ladder()),
         ("pipeline runs end to end", pipeline_problems),
-        ("same complaint twice = one action", check_idempotency(report)),
+        ("same complaint twice = one action", check_idempotency()),
     ]
 
     total = 0
