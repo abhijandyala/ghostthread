@@ -1,0 +1,45 @@
+{
+  "_comment": "Episodic memories to load into HydraDB before a demo, written through memory.memory_write by scripts/seed_memory.py. This file is DATA: it holds prior contacts that genuinely happened, never counts, tones or verdicts - those are read back out of the system afterwards. Recency is an offset in days before 'now', like fixtures/corpus.json uses hours, so nothing here goes stale overnight. Add actors and topics by editing this file; the seeder needs no change.",
+  "_schema": {
+    "actors[].actor": "REQUIRED. Must match the author_email the live complaint carries, exactly. This is the metadata key memory_read filters on; a mismatch reads back as zero prior contacts, which is a legitimate answer and therefore a silent failure.",
+    "actors[].topics[].episodes[]": "One prior contact each, mapped 1:1 onto contracts.MemoryWriteInput. complaint_id is prefixed with the source it came from, which is how memory.py attributes a memory to a source when the kill shot narrows scope.",
+    "actors[].topics[].episodes[].resolved_days_ago": "Whole days before now. Converted to an absolute date at write time.",
+    "actors[].topics[].live_complaint": "Not written to memory. It is the third contact, posted live during the demo, and the seeder reuses its text as the retrieval probe so the verification query is the same query the demo will run.",
+    "_ticket_urls": "The NB-* tickets are the prior resolutions SEED.md describes. They are demo history, not live Linear issues, and the urls are not expected to resolve in a browser."
+  },
+  "actors": [
+    {
+      "actor": "ops@northbeam.io",
+      "display_name": "Northbeam",
+      "topics": [
+        {
+          "id": "csv-export-truncation",
+          "live_complaint": {
+            "id": "slack-nb-seedcheck",
+            "source": "slack",
+            "channel_or_thread": "#all-testteam",
+            "text": "Northbeam, third time on this: the CSV export is still dropping rows. We were told twice this was fixed. 8,400 contacts exported, 212 missing, every one with a non-ASCII character in the name. We need someone senior on this."
+          },
+          "episodes": [
+            {
+              "complaint_id": "gmail-nb-104",
+              "resolved_days_ago": 35,
+              "category": "genuine_bug",
+              "summary": "CSV export truncating rows: the Friday export came out with 1,204 rows in the file against 1,231 on the dashboard, with no error - the file just ended. Reconciled against finance, so the gap was noticed. Closed as NB-104: export pagination dropped the final partial page.",
+              "action_taken": ["file_ticket", "reply"],
+              "ticket_url": "https://linear.app/agentsloveyou2hackathon/issue/NB-104"
+            },
+            {
+              "complaint_id": "slack-nb-118",
+              "resolved_days_ago": 21,
+              "category": "genuine_bug",
+              "summary": "CSV export short by a handful of rows again - the same defect closed a couple of weeks earlier had come back. Closed as NB-118: reopened, off-by-one in the page-boundary fix.",
+              "action_taken": ["link_existing_ticket", "file_ticket", "reply"],
+              "ticket_url": "https://linear.app/agentsloveyou2hackathon/issue/NB-118"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

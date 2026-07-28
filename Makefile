@@ -10,7 +10,7 @@ PY = $(shell if [ -x .venv/Scripts/python.exe ]; then echo .venv/Scripts/python.
 UVICORN = $(shell if [ -x .venv/Scripts/uvicorn.exe ]; then echo .venv/Scripts/uvicorn.exe; else echo .venv/bin/uvicorn; fi)
 export PYTHONPATH := src
 
-.PHONY: demo verify killshot run seed test smoke demo-ready venv
+.PHONY: demo verify killshot run seed test smoke demo-ready eval venv
 
 venv:
 	python -m venv .venv
@@ -37,6 +37,11 @@ smoke:
 # The pre-stage check. Same as smoke, but a stubbed node is a failure.
 demo-ready:
 	$(PY) scripts/smoke.py --demo-ready
+
+# The pre-rehearsal check. Asserts the grounding invariants against the live
+# tenant, and proves it can fail via the negative controls.
+eval:
+	$(PY) scripts/eval.py
 
 seed:
 	$(PY) scripts/seed_insforge.py

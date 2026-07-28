@@ -35,6 +35,7 @@ import hydra_db
 from . import config
 from .contracts import IntentProfile, LeakResult, LeakVerdict, WorkItemRef
 from .intent import get_profile
+from .resolve import extract_email, slack_emails
 
 COMPLAINT_PROVIDERS = ("slack", "gmail")
 WORK_PROVIDERS = ("linear", "github")
@@ -117,6 +118,12 @@ class Document:
     url: str
     timestamp: float
     actor_email: str
+    # The source's own handle for the author -- a Slack member id, a Linear
+    # user id. Kept alongside the address rather than in place of it: it is
+    # what still identifies the document when no address could be resolved,
+    # and it must never be poured into `actor_email`, which downstream joins
+    # assume is an address.
+    actor_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -178,24 +185,89 @@ def _client() -> hydra_db.HydraDB:
     return hydra_db.HydraDB(token=config.HYDRA_TOKEN)
 
 
-def _iso_to_epoch(value: Any) -> float:
+def _to_epoch(value: Any) -> float:
+    """Epoch seconds from an ISO-8601 string or from a native epoch value.
+
+    Both shapes are in the tenant: a hand ingest writes ISO, while a connector
+    passes the provider's own clock through untouched — Slack's `slack_ts` is
+    already epoch seconds carried as a string.
+    """
     if not value:
         return 0.0
     from datetime import datetime
 
-    text = str(value).replace("Z", "+00:00")
+    text = str(value).strip()
     try:
-        return datetime.fromisoformat(text).timestamp()
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return 0.0
 
 
+# Where an address may be hiding, in preference order. A `from` header arrives
+# as `Name <a@b.com>`, so every candidate goes through `extract_email` rather
+# than being taken at face value.
+_ACTOR_EMAIL_KEYS = (
+    "author_email",
+    "reporter_email",
+    "from",
+    "sender",
+    "actor",
+    "email",
+)
+# The source's own opaque handle for the author. Deliberately a separate list:
+# a member id is a real identifier and never an address.
+_ACTOR_ID_KEYS = ("slack_author_id", "author_id", "user_id", "entity_id", "user")
+
+
 def _actor_of(meta: dict[str, Any]) -> str:
-    for key in ("author_email", "reporter_email", "from", "sender", "slack_author_id", "actor"):
-        value = meta.get(key)
-        if value:
-            return str(value).lower()
+    """The author's address, if the document carries one anywhere.
+
+    Only an address is admitted. A member id in this field would make a Slack
+    complaint look attributed while matching nothing — entity resolution and
+    `memory_read`'s actor filter both key on email — and a join that silently
+    never fires is indistinguishable from a person with no history.
+    """
+    for key in _ACTOR_EMAIL_KEYS:
+        found = extract_email(meta.get(key))
+        if found:
+            return found
     return ""
+
+
+def _actor_id_of(meta: dict[str, Any]) -> str:
+    for key in _ACTOR_ID_KEYS:
+        value = str(meta.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _metadata_of(payload: dict[str, Any]) -> dict[str, Any]:
+    """Flatten every metadata shape `context.inspect` may return into one dict.
+
+    There are two, and neither is a superset of the other. A hand ingest — the
+    Gmail OAuth path, and the older Linear fixtures — writes
+    `additional_metadata` / `document_metadata` / `tenant_metadata`. A document
+    synced by a HydraDB managed connector carries none of those and instead
+    holds `app_metadata` (the connector's own handles: connector_id, member id,
+    channel) and `app_fields` (the provider's record: author, body, created_at).
+
+    Reading only the first shape is how every connector-synced document came to
+    load with no metadata and therefore no actor at all. They are merged rather
+    than chosen between, with an explicit ingest's keys winning, because a
+    single tenant holds both kinds at once.
+    """
+    return {
+        **(payload.get("app_metadata") or {}),
+        **(payload.get("app_fields") or {}),
+        **(payload.get("additional_metadata") or {}),
+        **(payload.get("document_metadata") or {}),
+        **(payload.get("tenant_metadata") or {}),
+    }
 
 
 _collection_cache: dict[str, set[str]] = {}
@@ -340,19 +412,28 @@ def load_documents_result(
         except (TypeError, ValueError):
             return None
         content = payload.get("content") or {}
-        meta = {
-            **(payload.get("additional_metadata") or {}),
-            **(payload.get("document_metadata") or {}),
-            **(payload.get("tenant_metadata") or {}),
-        }
+        meta = _metadata_of(payload)
+        # A connector document has no top-level `timestamp` and may carry its
+        # body only under the provider's own field name, so both fall back to
+        # the flattened metadata instead of coming out empty.
         return Document(
             id=str(payload.get("id") or doc_id),
             provider=provider,
-            title=str(payload.get("title") or ""),
-            text=str(content.get("text") or content.get("markdown") or ""),
-            url=str(payload.get("url") or ""),
-            timestamp=_iso_to_epoch(payload.get("timestamp")),
+            title=str(payload.get("title") or meta.get("title") or ""),
+            text=str(
+                content.get("text")
+                or content.get("markdown")
+                or meta.get("body")
+                or ""
+            ),
+            url=str(payload.get("url") or meta.get("url") or ""),
+            timestamp=(
+                _to_epoch(payload.get("timestamp"))
+                or _to_epoch(meta.get("created_at"))
+                or _to_epoch(meta.get("slack_ts"))
+            ),
             actor_email=_actor_of(meta),
+            actor_id=_actor_id_of(meta),
             metadata=meta,
         )
 
@@ -363,6 +444,7 @@ def load_documents_result(
     with ThreadPoolExecutor(max_workers=min(len(ids), MAX_WORKERS)) as pool:
         docs = [d for d in pool.map(fetch, ids) if d is not None]
     unreadable = len(ids) - len(docs)
+    _resolve_slack_actors(docs)
 
     if not docs:
         return SourceLoad(
@@ -375,6 +457,58 @@ def load_documents_result(
     if not unreadable:
         _document_cache[provider] = docs
     return SourceLoad(provider=provider, documents=docs, unreadable=unreadable)
+
+
+SLACK_PROVIDER = "slack"
+SLACK_AUTHOR_ID_KEY = "slack_author_id"
+
+
+def _slack_member_id(doc: Document) -> str:
+    """The member id a document names its Slack author by, if it names one.
+
+    A connector-synced message puts it in `slack_author_id`. A hand ingest of
+    the same channel puts it in the generic `entity_id`, which for every other
+    provider holds an address — so the generic field is only read as a member
+    id when the document came from Slack in the first place.
+    """
+    found = str(doc.metadata.get(SLACK_AUTHOR_ID_KEY) or "").strip()
+    if found:
+        return found
+    return doc.actor_id if doc.provider == SLACK_PROVIDER else ""
+
+
+def _resolve_slack_actors(documents: list[Document]) -> None:
+    """Give Slack documents an address, where Slack will supply one.
+
+    Slack puts no address on a message — only a member id and a display name —
+    so this is the only point at which a Slack complaint can be recognised as
+    the same human as a Gmail complaint or an existing memory. Both of those
+    key on email.
+
+    Run once over the whole load rather than per document, so a channel of a
+    hundred messages from two people costs two `users.info` calls, and only for
+    the ids actually present. A document whose id does not resolve keeps its
+    empty `actor_email` and its `actor_id`: no token, an API error and a bot
+    author are all honest reasons to have no address, and inventing one would
+    make `memory_read` answer about somebody else.
+    """
+    pending: set[str] = set()
+    for doc in documents:
+        if not doc.actor_email:
+            pending.add(_slack_member_id(doc))
+    pending.discard("")
+    if not pending:
+        return
+
+    emails = slack_emails(sorted(pending))
+    if not emails:
+        return
+    for doc in documents:
+        if doc.actor_email:
+            continue
+        found = emails.get(_slack_member_id(doc), "")
+        if found:
+            doc.actor_email = found
 
 
 def load_documents(

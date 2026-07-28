@@ -1,0 +1,29 @@
+{
+  "schema_version": "1",
+  "description": "Layer 2 of the eval suite: expected verdicts for named complaints in the demo tenant. Data, not code, so the table can be filled in by whoever seeds the tenant and so verify_no_hardcoding.py never finds a demo entity name inside src/. A case whose complaint_id is not present in the tenant is SKIPPED, never passed.",
+  "fields": {
+    "id": "stable handle for this case, used as the check id in the report",
+    "complaint_id": "the complaint document id as it appears in HydraDB, i.e. the value that shows up in LeakVerdict.complaint_ids",
+    "expect_verdict": "one of leak | resolved | unknown",
+    "expect_work_sources": "optional; the set of providers the matched work must come from, e.g. [\"linear\"]. Omit or leave empty to assert only on the verdict.",
+    "note": "why this case is here, for whoever reads a skip or a failure"
+  },
+  "cases": [
+    {
+      "id": "illustrative-leak",
+      "complaint_id": "replace-with-a-real-complaint-id-that-never-became-work",
+      "expect_verdict": "leak",
+      "expect_work_sources": [],
+      "note": "Illustrative only. Replace the complaint_id with a seeded complaint that has no matching Linear issue or GitHub item. Until then this case skips."
+    },
+    {
+      "id": "illustrative-resolved",
+      "complaint_id": "replace-with-a-real-complaint-id-that-was-tracked",
+      "expect_verdict": "resolved",
+      "expect_work_sources": [
+        "linear"
+      ],
+      "note": "Illustrative only. Replace the complaint_id with a seeded complaint that was tracked in Linear. Until then this case skips."
+    }
+  ]
+}
