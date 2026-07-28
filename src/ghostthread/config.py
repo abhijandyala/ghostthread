@@ -33,6 +33,12 @@ HYDRA_BASE_URL = os.getenv("HYDRA_BASE_URL") or None
 PIPESHIFT_API_KEY = os.getenv("PIPESHIFT_API_KEY", "")
 PIPESHIFT_BASE_URL = os.getenv("PIPESHIFT_BASE_URL", "https://api.pipeshift.com/api/v0")
 PIPESHIFT_MODEL = os.getenv("PIPESHIFT_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+# The second deployed model. Classification wants a fast instruction model;
+# code generation wants one that has read code. Same key, same OpenAI-compatible
+# endpoint, different deployment -- see fixgen.py.
+PIPESHIFT_CODE_MODEL = os.getenv(
+    "PIPESHIFT_CODE_MODEL", "deepseek-ai/deepseek-coder-6.7b-instruct"
+)
 
 # --- InsForge (intent profile / governance) ---------------------------------
 INSFORGE_BASE_URL = os.getenv("INSFORGE_BASE_URL", "")
@@ -44,7 +50,9 @@ LOCAL_PROFILE_PATH = Path(
     os.getenv("LOCAL_PROFILE_PATH", REPO_ROOT / "insforge" / "intent_profile.json")
 )
 
-# --- Coding agent (NOT the graded Pipeshift requirement) --------------------
+# --- Coding agent fallback (NOT the graded Pipeshift requirement) -----------
+# Used by fixgen.py only when PIPESHIFT_API_KEY is absent, and every proposal it
+# produces is labelled degraded.
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CODING_AGENT_MODEL = os.getenv("CODING_AGENT_MODEL", "claude-sonnet-4-20250514")
 CODING_AGENT_MAX_TOKENS = int(os.getenv("CODING_AGENT_MAX_TOKENS", "1500"))
@@ -91,6 +99,10 @@ def capability_report() -> dict[str, bool]:
         "pipeshift": bool(PIPESHIFT_API_KEY),
         "insforge": bool(INSFORGE_BASE_URL and INSFORGE_API_KEY),
         "coding_agent": bool(ANTHROPIC_API_KEY),
+        # The graded second Pipeshift model. True only when the specialised code
+        # deployment is reachable; the Anthropic fallback does not set it.
+        "pipeshift_code_model": bool(PIPESHIFT_API_KEY),
+        "fix_generator": bool(PIPESHIFT_API_KEY or ANTHROPIC_API_KEY),
         "linear_write": bool(LINEAR_TOKEN),
         "slack_write": bool(SLACK_TOKEN),
         "gmail_write": bool(

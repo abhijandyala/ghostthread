@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 import httpx
 
-from . import config, google_auth
+from . import config, fixgen, google_auth
 from .contracts import (
     ExtractedFacts,
     IntentProfile,
@@ -134,8 +134,16 @@ def create_ticket(
 
 
 # --- sandboxed coding agent ---------------------------------------------------
-# Explicitly NOT the graded Pipeshift step. This runs a general coding model
-# against a disposable repo that is created fresh and never points at production.
+# The patch itself comes from `fixgen.py` -- Pipeshift DeepSeek Coder when the
+# key is present, a general coding model (labelled degraded) when it is not.
+# This section owns only the safety envelope around it: the allowlist is checked
+# before anything is touched, DRY_RUN gates the write, and the PR is never
+# merged. The repo is disposable and never points at production.
+#
+# Labels for a pull request the confidence gate did or did not clear. Structural
+# strings, not policy: the *threshold* is profile data, these are just names.
+READY_LABEL = "ready for review"
+LOW_CONFIDENCE_LABEL = "low confidence -- needs human review"
 
 
 def _ensure_sandbox() -> Path:
@@ -167,74 +175,83 @@ def allowlist_check(profile: IntentProfile) -> tuple[bool, str]:
     return True, f"{target} is on the sandbox allowlist"
 
 
+def _fix_confidence_threshold(profile: IntentProfile) -> float:
+    """The line between "ready for review" and "a human must read this first".
+
+    Profile data, like every other threshold. The fallback is the classification
+    floor rather than a number typed here, so a profile that forgets the key
+    still gates on something real instead of on a literal nobody can edit.
+    """
+    return float(
+        profile.override("min_confidence_for_fix_pr", profile.min_confidence_for_autoaction)
+    )
+
+
 def attempt_fix(
     facts: ExtractedFacts,
     profile: IntentProfile,
     ticket_id: Optional[str],
     memory: Optional[MemoryReadResult] = None,
 ) -> tuple[bool, Optional[str], dict[str, Any]]:
-    """Ask a coding model for a minimal patch inside the sandbox repo."""
+    """Draft a minimal patch inside the sandbox repo, via the Pipeshift code model.
+
+    Order matters and is not negotiable: allowlist first, so a blocked repo is
+    never even described to a model; then generate; then the confidence gate;
+    then DRY_RUN, which is the last thing standing between a diff and a branch.
+    """
     permitted, why = allowlist_check(profile)
     if not permitted:
         return False, None, {"blocked": why}
 
     root = _ensure_sandbox()
-    if not config.ANTHROPIC_API_KEY:
-        return False, None, {"skipped": "ANTHROPIC_API_KEY not configured", "allowlist": why}
 
+    generator = fixgen.FixGenerator()
     # Regression evidence from the memory read is what turns a broad search into
     # a targeted one. Without it the model is guessing at which file to open,
-    # and the PR says so rather than pretending otherwise.
-    target = facts.file_hint or "unknown_component"
-    scope_lines = []
-    if facts.regression_evidence:
-        scope_lines.append(
-            f"History implicates {facts.regression_evidence} in this regression. "
-            f"Start there."
+    # and the proposal says so rather than pretending otherwise.
+    proposal = generator.generate(
+        fixgen.FixRequest(
+            complaint_id=facts.complaint_id,
+            what_broke=facts.what_broke,
+            file_hint=facts.file_hint,
+            regression_evidence=facts.regression_evidence,
+            prior_resolutions=len(memory.prior_resolutions) if memory else 0,
         )
-    else:
-        scope_lines.append(
-            "No regression evidence is available, so the target is a guess. "
-            "Prefer the smallest plausible change and say if you are unsure."
-        )
-    if memory is not None and memory.prior_resolutions:
-        scope_lines.append(
-            f"This topic has been resolved {len(memory.prior_resolutions)} time(s) "
-            f"before; a recurrence suggests the earlier fix was incomplete."
-        )
-
-    prompt = "\n".join(
-        [
-            "You are fixing a single, small, well-scoped bug in a Python service.",
-            f"Reported problem: {facts.what_broke}",
-            f"Suspected component: {target}",
-            *scope_lines,
-            "",
-            "Return a unified diff and nothing else. Keep the change minimal. "
-            "If you cannot determine the fix with confidence, return the single word SKIP.",
-        ]
     )
 
-    try:
-        diff = _call_coding_model(prompt)
-    except Exception as exc:
-        return False, None, {"error": str(exc), "allowlist": why}
+    threshold = _fix_confidence_threshold(profile)
+    confidence = proposal.confidence
+    # An unscored patch is treated exactly as an under-scored one. `is None`
+    # first, so the comparison below never runs against a missing confidence.
+    low_confidence = confidence is None or confidence < threshold
 
-    if not diff or diff.strip() == "SKIP":
-        return False, None, {"result": "model declined to patch", "allowlist": why}
+    meta: dict[str, Any] = {
+        "allowlist": why,
+        "generator": proposal.to_dict(),
+        "confidence": confidence,
+        "confidence_threshold": threshold,
+        "low_confidence": low_confidence,
+        "pr_label": LOW_CONFIDENCE_LABEL if low_confidence else READY_LABEL,
+        "targeted": proposal.targeted,
+        "regression_evidence": facts.regression_evidence,
+        "files_touched": proposal.files_touched,
+        # Two independent statements, both true, both shown: a draft PR is never
+        # merged by this system, and the profile says so too.
+        "never_automerge": profile.never_automerge,
+        "draft_only": True,
+        "degraded": proposal.degraded,
+        "degraded_reason": proposal.degraded_reason,
+    }
+
+    if proposal.declined:
+        # No diff means no diff. Nothing downstream synthesises one.
+        return False, None, {**meta, "result": proposal.explanation}
 
     branch = f"ghostthread/{(ticket_id or facts.complaint_id).lower()}"
     patch_path = root / f"{branch.replace('/', '_')}.patch"
-    patch_path.write_text(diff, encoding="utf-8")
+    patch_path.write_text(proposal.diff, encoding="utf-8")
 
-    meta = {
-        "branch": branch,
-        "diff": diff,
-        "allowlist": why,
-        "targeted": bool(facts.regression_evidence),
-        "regression_evidence": facts.regression_evidence,
-        "never_automerge": profile.never_automerge,
-    }
+    meta.update({"branch": branch, "diff": proposal.diff, "explanation": proposal.explanation})
 
     if config.DRY_RUN:
         return True, None, {**meta, "dry_run": True, "patch_file": str(patch_path)}
@@ -245,27 +262,9 @@ def attempt_fix(
         return False, None, {**meta, "error": applied.stderr.decode()[:500]}
     subprocess.run(["git", "add", "-A"], cwd=root, check=False)
     subprocess.run(["git", "commit", "-qm", f"fix: {facts.what_broke[:60]}"], cwd=root, check=False)
+    # A branch and a patch file. Opening the draft PR is a separate, reviewed
+    # step; nothing here merges anything, whatever the profile says.
     return True, f"sandbox://{root.name}/{branch}", meta
-
-
-def _call_coding_model(prompt: str) -> str:
-    """Claude only. This is the fix-drafting agent, not the graded model step."""
-    resp = httpx.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": config.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": config.CODING_AGENT_MODEL,
-            "max_tokens": config.CODING_AGENT_MAX_TOKENS,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=90.0,
-    )
-    resp.raise_for_status()
-    return "".join(block.get("text", "") for block in resp.json().get("content", []))
 
 
 # --- replying to the human who reported it -----------------------------------
@@ -443,9 +442,13 @@ def resolve(
         performed.append(LINK_ACTION)
 
     fix_attempted, fix_url = False, None
+    pr_confidence: Optional[float] = None
     if FIX_ACTION in permitted:
         fix_attempted, fix_url, fix_meta = attempt_fix(facts, profile, ticket_id, memory)
         meta["fix"] = fix_meta
+        # Stays None when the generator reported no confidence. Rendering an
+        # unscored patch as 0.00 would read as "the model was sure it was wrong".
+        pr_confidence = fix_meta.get("confidence")
         if fix_attempted:
             performed.append(FIX_ACTION)
 
@@ -475,6 +478,7 @@ def resolve(
         ticket_url=ticket_url,
         fix_attempted=fix_attempted,
         fix_pr_url=fix_url,
+        pr_confidence=pr_confidence,
         reply_sent=reply_sent,
         reply_channel=reply_channel,
         decision=decision.reason,
