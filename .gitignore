@@ -6,3 +6,4 @@ sandbox_repo/
 .DS_Store
 .rocketride/
 .claude/worktrees/
+node_modules/

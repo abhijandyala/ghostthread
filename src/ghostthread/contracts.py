@@ -19,7 +19,7 @@ the previous version still constructs.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, get_args
 
 Source = Literal["slack", "gmail", "linear", "github"]
 COMPLAINT_SOURCES: tuple[str, ...] = ("slack", "gmail")
@@ -50,21 +50,10 @@ Category = Literal[
     "internal_notice",
     "unclear",
 ]
-CATEGORIES: tuple[str, ...] = (
-    "genuine_bug",
-    "user_error",
-    "question",
-    "feature_request",
-    "feedback_positive",
-    "feedback_negative",
-    "duplicate_or_known_issue",
-    "security_concern",
-    "billing_or_account",
-    "outage_or_urgent",
-    "spam_or_unrelated",
-    "internal_notice",
-    "unclear",
-)
+# Derived, not repeated. A second hand-written copy of the taxonomy is a copy
+# that eventually disagrees with the type, and the disagreement would show up as
+# a category that type-checks but is never validated against the policy.
+CATEGORIES: tuple[str, ...] = get_args(Category)
 
 # The catch-all a low-confidence classification collapses to. Named once, here,
 # so the router can reference it without a bare string literal.
@@ -300,6 +289,43 @@ class RoutingDecision(_JsonMixin):
 
 
 @dataclass
+class WorkItemRef(_JsonMixin):
+    source: str  # "linear" | "github"
+    id: str
+    url: str
+    title: str = ""
+    score: float = 0.0
+
+
+@dataclass
+class LeakVerdict(_JsonMixin):
+    """Track A's output, per issue cluster. Frozen with Track B.
+
+    `confidence` is None whenever the verdict is "unknown" - the point of the
+    kill shot is that the system refuses to score an answer it cannot ground,
+    rather than reporting a confident false negative.
+    """
+
+    issue_cluster_id: str
+    verdict: str  # "leak" | "resolved" | "unknown"
+    confidence: Optional[float]
+    complaint_ids: list[str]
+    matched_work_items: list[dict[str, Any]]
+    sources_used: list[str]  # connector_ids in scope
+    sources_missing: list[str]  # connector_ids out of scope
+    # Beyond the frozen contract: kept so the UI can explain a verdict and so
+    # the eval suite can assert on more than the label.
+    complaint_texts: list[str] = field(default_factory=list)
+    actor_emails: list[str] = field(default_factory=list)
+    providers_used: list[str] = field(default_factory=list)
+    providers_missing: list[str] = field(default_factory=list)
+    best_score: float = 0.0
+    threshold: float = 0.0
+    reasons: list[str] = field(default_factory=list)
+    latency_ms: float = 0.0
+
+
+@dataclass
 class ResolutionAction(_JsonMixin):
     leak: dict[str, Any]
     facts: dict[str, Any]
@@ -369,6 +395,16 @@ class IntentProfile(_JsonMixin):
     # Upper bound of each severity band, for rendering a float as a word.
     severity_bands: dict[str, float] = field(default_factory=dict)
 
+    # -- Track A / grounding knobs --------------------------------------------
+    # A2 cut rule: customers are not GitHub users, so a complaint rarely
+    # resembles a commit. When true, a GitHub match only counts if it cites a
+    # Linear issue that also matched the same complaint.
+    anchor_github_via_linear: bool = False
+    # HydraDB recall mode. "thinking" expands and reranks the query but costs
+    # ~4.2s against ~0.4s for "auto", which alone exceeds the latency budget.
+    recall_mode: str = "auto"
+
+
     version: str = "0"
     origin: str = "unknown"
 
@@ -411,8 +447,16 @@ class IntentProfile(_JsonMixin):
         return [c for c in CATEGORIES if c not in self.category_policy]
 
     def severity_band(self, severity: float) -> str:
-        """Render a severity float as a word, using bands from the profile."""
-        for label, ceiling in sorted(self.severity_bands.items(), key=lambda kv: kv[1]):
+        """Render a severity float as a word, using bands from the profile.
+
+        Anything over every ceiling belongs to the top band the profile defines,
+        whatever that band happens to be called. Naming the terminal band in code
+        would put one band label outside the document that owns the rest of them.
+        """
+        bands = sorted(self.severity_bands.items(), key=lambda kv: kv[1])
+        for label, ceiling in bands:
             if severity <= ceiling:
                 return label
-        return "high"
+        if bands:
+            return bands[-1][0]
+        return "unknown"  # no bands configured: say so rather than invent one
