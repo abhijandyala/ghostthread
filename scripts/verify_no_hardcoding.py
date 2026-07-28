@@ -28,7 +28,11 @@ CORPUS = ROOT / "fixtures" / "corpus.json"
 
 # Modules that decide verdicts or actions. These must contain no bare numeric
 # thresholds; everything comes from the profile.
-DECISION_MODULES = ["leaks.py", "act.py"]
+#
+# router.py routes every complaint and memory.py sets the reply tone ladder, so
+# both are decision surfaces and both are checked. If a threshold appears here,
+# the "not hardcoded" claim is false.
+DECISION_MODULES = ["leaks.py", "act.py", "router.py", "memory.py"]
 
 
 def check_no_entity_names() -> list[str]:
