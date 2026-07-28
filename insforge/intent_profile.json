@@ -10,7 +10,7 @@
   ],
   "min_sources_required": 2,
   "risk_threshold": 0.45,
-  "match_threshold": 0.55,
+  "match_threshold": 0.36,
   "match_weights": {
     "identity": 0.25,
     "semantic": 0.35,
@@ -145,7 +145,8 @@
     "min_confidence_for_fix_pr": 0.7,
     "never_automerge": true,
     "sandbox_repo_allowlist": [
-      "testteam-agentsloveyou2hackathon/testteam"
+      "testteam-agentsloveyou2hackathon/testteam",
+      "Suvan8806/testteam-sandbox"
     ]
   }
 }
