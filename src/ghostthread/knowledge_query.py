@@ -41,6 +41,16 @@ WORK_PROVIDERS = ("linear", "github")
 ALL_PROVIDERS = COMPLAINT_PROVIDERS + WORK_PROVIDERS
 
 MAX_WORKERS = 12
+PAGE_SIZE = 100
+
+
+class SourceUnavailable(RuntimeError):
+    """A HydraDB read failed, as opposed to completing and finding nothing.
+
+    The two are the same empty list to a caller that only gets the contents
+    back, and that is how a scoped run ends up asserting "nothing here" about a
+    source it never reached.
+    """
 # Linear identifiers look like ABC-123; GitHub refs like #123 or gh-123.
 _LINEAR_REF = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d{1,6})\b")
 _GITHUB_REF = re.compile(r"(?:#|gh-)(\d{1,6})\b")
@@ -191,23 +201,40 @@ def _actor_of(meta: dict[str, Any]) -> str:
 _collection_cache: dict[str, set[str]] = {}
 
 
-def live_collections(
+def probe_collections(
     client: Optional[hydra_db.HydraDB] = None, refresh: bool = False
-) -> set[str]:
-    """Collections that hold documents. Naming an empty one is a 400.
+) -> tuple[set[str], str]:
+    """Collections that hold documents, plus why the listing failed if it did.
 
-    Cached: this is consulted before every query and costs ~330ms uncached.
+    Naming an empty collection is a 400, so this is consulted before every
+    query. Cached: it costs ~330ms uncached.
+
+    The error comes back rather than being swallowed because an unreachable
+    HydraDB and an empty tenant are the same empty set, and every caller that
+    reports a result to a human has to be able to tell them apart.
     """
     if not refresh and "value" in _collection_cache:
-        return _collection_cache["value"]
+        return _collection_cache["value"], ""
     client = client or _client()
     try:
         env = client.databases.collections(database=config.HYDRA_DATABASE)
         found = set(getattr(env.data, "sub_tenant_ids", None) or [])
-    except Exception:
-        return set()
+    except Exception as exc:
+        return set(), f"collection listing failed: {type(exc).__name__}: {exc}"
     _collection_cache["value"] = found
-    return found
+    return found, ""
+
+
+def live_collections(
+    client: Optional[hydra_db.HydraDB] = None, refresh: bool = False
+) -> set[str]:
+    """Membership-test view of `probe_collections`. Lossy on purpose.
+
+    A failed listing is an empty set here, which is fine for "may I name this
+    collection in a query" and wrong for anything that reports a finding. Use
+    `probe_collections` when the difference reaches a human.
+    """
+    return probe_collections(client, refresh)[0]
 
 
 _document_cache: dict[str, list[Document]] = {}
@@ -219,25 +246,56 @@ def refresh_documents() -> None:
     _collection_cache.clear()
 
 
-def load_documents(
+@dataclass
+class SourceLoad:
+    """The outcome of reading one collection, not merely its contents.
+
+    `documents == []` is ambiguous on its own. `ok` says whether the read
+    completed, `present` says whether the collection exists at all, and
+    `unreadable` counts documents that were enumerated but could not be
+    fetched — a partial read that would otherwise look like a short source.
+    """
+
+    provider: str
+    documents: list[Document] = field(default_factory=list)
+    error: str = ""
+    present: bool = True
+    unreadable: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+def load_documents_result(
     provider: str, client: Optional[hydra_db.HydraDB] = None, refresh: bool = False
-) -> list[Document]:
+) -> SourceLoad:
     """Enumerate a collection, then inspect each source for its full content.
 
     `context.list` only returns ids and titles, and its `include_fields` rejects
     content, so the body has to come from `context.inspect`. Enumerating rather
     than searching matters: a search term would silently drop any complaint that
     did not match it, and a missed complaint is indistinguishable from a leak.
+
+    Every failure below used to be a `break` or a `None` and therefore arrived
+    at the caller as a short list. They are reported instead, because a leak
+    report built on a source that failed to load is a fabricated one.
     """
     if not refresh and provider in _document_cache:
-        return _document_cache[provider]
+        return SourceLoad(provider=provider, documents=_document_cache[provider])
 
     client = client or _client()
-    if provider not in live_collections(client):
-        return []
+    found, probe_error = probe_collections(client)
+    if probe_error:
+        return SourceLoad(provider=provider, error=probe_error)
+    if provider not in found:
+        # A real answer: the tenant holds no such collection. Distinct from
+        # not having been able to look, which is the branch above.
+        return SourceLoad(provider=provider, present=False)
 
     ids: list[str] = []
     page = 1
+    listing_error = ""
     while True:
         try:
             resp = client.context.list(
@@ -245,10 +303,13 @@ def load_documents(
                 collection=provider,
                 type="knowledge",
                 page=page,
-                page_size=100,
+                page_size=PAGE_SIZE,
                 include_fields=["title"],
             )
-        except Exception:
+        except Exception as exc:
+            listing_error = (
+                f"listing failed at page {page}: {type(exc).__name__}: {exc}"
+            )
             break
         sources = getattr(resp.data, "sources", None) or []
         if not sources:
@@ -257,9 +318,12 @@ def load_documents(
             doc_id = src.get("id") if isinstance(src, dict) else getattr(src, "id", None)
             if doc_id:
                 ids.append(str(doc_id))
-        if len(sources) < 100:
+        if len(sources) < PAGE_SIZE:
             break
         page += 1
+
+    if listing_error:
+        return SourceLoad(provider=provider, error=listing_error)
 
     def fetch(doc_id: str) -> Optional[Document]:
         try:
@@ -294,11 +358,31 @@ def load_documents(
 
     if not ids:
         _document_cache[provider] = []
-        return []
+        return SourceLoad(provider=provider)
+
     with ThreadPoolExecutor(max_workers=min(len(ids), MAX_WORKERS)) as pool:
         docs = [d for d in pool.map(fetch, ids) if d is not None]
-    _document_cache[provider] = docs
-    return docs
+    unreadable = len(ids) - len(docs)
+
+    if not docs:
+        return SourceLoad(
+            provider=provider,
+            error=f"all {len(ids)} enumerated document(s) failed to inspect",
+            unreadable=unreadable,
+        )
+    # Only a clean read is cached. Caching a partial one would make the
+    # degradation permanent for the rest of the process.
+    if not unreadable:
+        _document_cache[provider] = docs
+    return SourceLoad(provider=provider, documents=docs, unreadable=unreadable)
+
+
+def load_documents(
+    provider: str, client: Optional[hydra_db.HydraDB] = None, refresh: bool = False
+) -> list[Document]:
+    """Contents-only view of `load_documents_result`, for callers that cannot
+    act on the difference between an empty source and an unreachable one."""
+    return load_documents_result(provider, client=client, refresh=refresh).documents
 
 
 # --- retrieval ---------------------------------------------------------------
@@ -314,6 +398,32 @@ class WorkCandidate:
     text: str
 
 
+@dataclass
+class WorkSearch:
+    """The outcome of a work-side retrieval, not merely its hits.
+
+    Three different things used to arrive as an empty list: nothing in scope
+    was live, every query raised, and a genuine no-match. Only the last of
+    those licenses a leak verdict, so they are kept apart here.
+    """
+
+    candidates: list[WorkCandidate] = field(default_factory=list)
+    # Providers that were queried and answered. This, not the requested scope,
+    # is what the verdict may claim to have looked at.
+    searched: list[str] = field(default_factory=list)
+    # Requested but holding no live collection, so never queried at all.
+    unavailable: list[str] = field(default_factory=list)
+    # Queried and raised. Their silence carries no information.
+    failed: dict[str, str] = field(default_factory=dict)
+    # Chunks dropped for coming from a collection outside the request.
+    out_of_scope_chunks: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def grounded(self) -> bool:
+        """True when at least one work provider actually answered."""
+        return bool(self.searched)
+
+
 def search_work(
     complaint_text: str,
     providers: list[str],
@@ -322,49 +432,111 @@ def search_work(
     client: Optional[hydra_db.HydraDB] = None,
     limit: int = 5,
     use_connector_filter: bool = True,
-) -> list[WorkCandidate]:
+) -> WorkSearch:
     """Retrieve possible matching work items, scoped to `providers`.
 
     Scoping is applied twice on purpose: `collections` narrows the corpus, and
     `metadata_filters.additional_metadata.connector_id` narrows to the exact
-    connectors in scope. The second is the kill-shot handle; belt and braces
-    means a stale collection cannot leak a source back into a scoped run.
+    connector. The second is the kill-shot handle; belt and braces means a stale
+    collection cannot leak a source back into a scoped run.
+
+    One query is issued per connector rather than one query for all of them.
+    That is not a style choice: a *list* of connector ids ANDs rather than ORs,
+    so `{"connector_id": [linear_id, github_id]}` matches zero documents. A
+    single query would therefore have returned nothing whenever both work
+    sources were in scope, and the retry-without-filter fallback would have
+    quietly turned it into a collection-scoped search - leaving the connector
+    filter dead while appearing to work.
+
+    Returns a `WorkSearch` rather than a list so the caller can tell a real
+    no-match from a scope that was never queried or a query that failed.
     """
     client = client or _client()
-    scope = [p for p in providers if p in live_collections(client)]
+    found, probe_error = probe_collections(client)
+    if probe_error:
+        return WorkSearch(failed={p: probe_error for p in providers})
+
+    scope = [p for p in providers if p in found]
+    unavailable = [p for p in providers if p not in found]
+    result = WorkSearch(unavailable=unavailable)
     if not scope:
-        return []
+        return result
 
-    kwargs: dict[str, Any] = dict(
-        query=complaint_text,
-        database=config.HYDRA_DATABASE,
-        collections=scope,
-        type="knowledge",
-        query_by="hybrid",
-        graph_context=True,
-        mode=profile.recall_mode,
-        max_results=limit,
-    )
-    connector_ids = registry.connector_ids(scope)
-    if use_connector_filter and connector_ids:
-        kwargs["metadata_filters"] = {"additional_metadata": {"connector_id": connector_ids}}
+    allowed = set(scope)
 
-    try:
-        envelope = client.query(**kwargs)
-    except Exception:
-        # A connector-id filter can legitimately match nothing (for example a
-        # source ingested outside the managed connectors). Retry on collection
-        # scope alone rather than reporting a false leak.
-        kwargs.pop("metadata_filters", None)
+    def one(provider: str) -> tuple[str, list[WorkCandidate], dict[str, int], str]:
+        kwargs: dict[str, Any] = dict(
+            query=complaint_text,
+            database=config.HYDRA_DATABASE,
+            collections=[provider],
+            type="knowledge",
+            query_by="hybrid",
+            graph_context=True,
+            mode=profile.recall_mode,
+            max_results=limit,
+        )
+        connector_id = registry.connector_id(provider)
+        if use_connector_filter and connector_id:
+            kwargs["metadata_filters"] = {
+                "additional_metadata": {"connector_id": connector_id}
+            }
         try:
             envelope = client.query(**kwargs)
-        except Exception:
-            return []
+        except Exception as exc:
+            return provider, [], {}, f"{type(exc).__name__}: {exc}"
+        candidates, dropped = _parse_chunks(envelope, provider, allowed)
+        return provider, candidates, dropped, ""
 
+    if len(scope) == 1:
+        batches = [one(scope[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=len(scope)) as pool:
+            batches = list(pool.map(one, scope))
+
+    merged: list[WorkCandidate] = []
+    for provider, candidates, dropped, error in batches:
+        if error:
+            result.failed[provider] = error
+            continue
+        result.searched.append(provider)
+        merged.extend(candidates)
+        for origin, count in dropped.items():
+            result.out_of_scope_chunks[origin] = (
+                result.out_of_scope_chunks.get(origin, 0) + count
+            )
+
+    # Relevancy is comparable across collections, so a single sort is a fair
+    # merge of the per-connector result sets.
+    merged.sort(key=lambda c: c.score, reverse=True)
+    result.candidates = merged[:limit]
+    result.searched.sort()
+    return result
+
+
+def _parse_chunks(
+    envelope: Any, provider: str, allowed: set[str]
+) -> tuple[list[WorkCandidate], dict[str, int]]:
+    """Turn chunks into candidates, dropping any from outside `allowed`.
+
+    The guard is not redundant with naming one collection in the query.
+    `graph_context=True` lets HydraDB pull in neighbours linked through
+    `relations`, and those links deliberately span collections — a document is
+    joined to a person, and that person appears in every source. A neighbour
+    from a collection this run was not allowed to read could resolve a
+    complaint the scope is supposed to be blind to, which is precisely the
+    claim the kill shot makes about itself.
+
+    Measured against this tenant, expansion never crossed a named collection
+    (36 probes, both recall modes, both graph settings). The guard stays
+    because that is a property of HydraDB's current behaviour and this tenant's
+    data, not a guarantee, and because dropping it costs a silent wrong answer.
+    """
     out: list[WorkCandidate] = []
+    dropped: dict[str, int] = {}
     for chunk in getattr(envelope.data, "chunks", None) or []:
-        provider = str(getattr(chunk, "sub_tenant_id", "") or "")
-        if provider not in scope:
+        origin = str(getattr(chunk, "sub_tenant_id", "") or provider)
+        if origin not in allowed:
+            dropped[origin] = dropped.get(origin, 0) + 1
             continue
         raw = str(getattr(chunk, "chunk_content", "") or "")
         title = str(getattr(chunk, "source_title", "") or "")
@@ -379,14 +551,14 @@ def search_work(
         out.append(
             WorkCandidate(
                 document_id=str(getattr(chunk, "id", "") or ""),
-                provider=provider,
+                provider=origin,
                 title=title,
                 url=url,
                 score=float(getattr(chunk, "relevancy_score", 0.0) or 0.0),
                 text=raw,
             )
         )
-    return out
+    return out, dropped
 
 
 # --- scoring -----------------------------------------------------------------
@@ -476,39 +648,95 @@ def evaluate(
     registry: ConnectorRegistry,
     profile: IntentProfile,
     client: Optional[hydra_db.HydraDB] = None,
+    complaint_providers_read: Optional[list[str]] = None,
 ) -> LeakVerdict:
+    """Decide whether one complaint became tracked work.
+
+    Everything reported here — coverage, `sources_used`, the reason strings —
+    is derived from the providers that actually answered, never from the ones
+    that were asked for. A requested provider with no live collection is
+    reported as requested-and-unavailable in `reasons`, because "we did not
+    look there" is information, but it may not inflate confidence.
+
+    `complaint_providers_read` is the complaint-side half of the same rule.
+    `detect_leaks` knows which loads succeeded; a direct caller does not, so
+    the declared scope is the fallback.
+    """
     started = time.perf_counter()
     work_scope = [p for p in providers_in_scope if p in WORK_PROVIDERS]
-    missing = [p for p in WORK_PROVIDERS if p not in work_scope]
+    declared_complaints = (
+        complaint_providers_read
+        if complaint_providers_read is not None
+        else providers_in_scope
+    )
+    complaint_used = [
+        p
+        for p in providers_in_scope
+        if p in COMPLAINT_PROVIDERS and p in set(declared_complaints)
+    ]
+
+    search = (
+        search_work(complaint.search_text, work_scope, registry, profile, client=client)
+        if work_scope
+        else WorkSearch()
+    )
+
+    # Only providers that answered count as used. GitHub with no collection is
+    # dropped inside `search_work`, and used to remain in the coverage figure
+    # and in the provenance line the demo points at.
+    used = sorted(set(complaint_used) | set(search.searched))
+    missing = [p for p in ALL_PROVIDERS if p not in used]
 
     base = dict(
         issue_cluster_id=f"{complaint.provider}:{complaint.id}",
         complaint_ids=[complaint.id],
         complaint_texts=[complaint.blob[:600]],
         actor_emails=[complaint.actor_email] if complaint.actor_email else [],
-        sources_used=registry.connector_ids(providers_in_scope),
+        sources_used=registry.connector_ids(used),
         sources_missing=registry.connector_ids(missing),
-        providers_used=sorted(providers_in_scope),
-        providers_missing=sorted(missing),
+        providers_used=used,
+        providers_missing=missing,
         threshold=profile.match_threshold,
     )
 
-    # No work-side source in scope means absence of tracked work cannot be
-    # established. Refusing to answer is the correct result, not a leak.
-    if not work_scope:
+    # Requested-but-not-searched is kept rather than dropped: which source went
+    # unread is as interesting as what the read ones said.
+    notes: list[str] = []
+    for provider in search.unavailable:
+        notes.append(
+            f"{provider} was in scope but holds no live collection, so it was never queried"
+        )
+    for provider, error in sorted(search.failed.items()):
+        notes.append(f"{provider} query failed ({error}); its silence is not evidence")
+    for origin, count in sorted(search.out_of_scope_chunks.items()):
+        notes.append(
+            f"dropped {count} chunk(s) from out-of-scope collection {origin} "
+            f"returned by graph expansion"
+        )
+
+    # Nothing on the work side answered, so absence of tracked work cannot be
+    # established. Refusing is the correct result, not a leak.
+    if not search.grounded:
+        if not work_scope:
+            why = "no work-side connector in scope"
+        elif search.failed:
+            why = "every work-side query failed"
+        else:
+            why = "no work-side connector in scope holds a live collection"
         return LeakVerdict(
             verdict="unknown",
             confidence=None,
             matched_work_items=[],
             best_score=0.0,
             reasons=[
-                "no work-side connector in scope: cannot distinguish untracked from unseen"
+                f"{why}: cannot distinguish untracked from unseen",
+                *notes,
             ],
             latency_ms=round((time.perf_counter() - started) * 1000, 1),
             **base,
         )
 
-    candidates = search_work(complaint.search_text, work_scope, registry, profile, client=client)
+    candidates = search.candidates
     best_score = 0.0
     best: Optional[WorkCandidate] = None
     reasons: list[str] = []
@@ -519,7 +747,10 @@ def evaluate(
             best_score, best = score, candidate
 
     if not candidates:
-        reasons.append(f"searched {', '.join(work_scope)} and found no candidate work")
+        reasons.append(
+            f"searched {', '.join(search.searched)} and found no candidate work"
+        )
+    reasons.extend(notes)
 
     resolved = best is not None and best_score >= profile.match_threshold
     matched = (
@@ -532,9 +763,10 @@ def evaluate(
         confidence = round(min(1.0, best_score), 4)
     else:
         # Confidence that it leaked rises as the best candidate weakens and as
-        # more independent work sources agree there is nothing there.
+        # more independent work sources agree there is nothing there. Coverage
+        # counts the sources that spoke, not the ones that were asked.
         margin = (profile.match_threshold - best_score) / max(profile.match_threshold, 1e-6)
-        coverage = len(work_scope) / len(WORK_PROVIDERS)
+        coverage = len(search.searched) / len(WORK_PROVIDERS)
         confidence = round(max(0.0, min(1.0, margin * coverage)), 4)
 
     return LeakVerdict(
@@ -579,6 +811,108 @@ def _merge_clusters(verdicts: list[LeakVerdict]) -> list[LeakVerdict]:
     return out
 
 
+@dataclass
+class LeakRun:
+    """A `detect_leaks` run together with what it was actually able to read.
+
+    An empty verdict list cannot say why it is empty. This can, which is the
+    difference between "this tenant holds no complaints" and "we reached
+    nothing". A caller that reports to a human must branch on `grounded`.
+    """
+
+    verdicts: list[LeakVerdict] = field(default_factory=list)
+    providers_requested: list[str] = field(default_factory=list)
+    # Complaint sources whose read completed, whether or not they held anything.
+    complaint_providers_read: list[str] = field(default_factory=list)
+    # Read successfully and genuinely holding nothing.
+    complaint_providers_empty: list[str] = field(default_factory=list)
+    # Requested, reachable, but no such collection exists in the tenant. An
+    # honest absence rather than a failure, and kept apart from both.
+    complaint_providers_absent: list[str] = field(default_factory=list)
+    # provider -> what went wrong. A provider can appear here *and* in
+    # `complaint_providers_read` when the read completed only in part.
+    errors: dict[str, str] = field(default_factory=dict)
+    complaints_examined: int = 0
+
+    @property
+    def grounded(self) -> bool:
+        """True when at least one complaint source was actually read."""
+        return bool(self.complaint_providers_read)
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.errors)
+
+
+def detect_leaks_run(
+    providers_in_scope: Optional[list[str]] = None,
+    profile: Optional[IntentProfile] = None,
+    registry: Optional[ConnectorRegistry] = None,
+) -> LeakRun:
+    """`detect_leaks` with the read status attached.
+
+    Use this anywhere the difference between "found no leaks" and "could not
+    look" changes what should be shown.
+    """
+    profile = profile or get_profile()
+    registry = registry or ConnectorRegistry()
+    scope = list(providers_in_scope) if providers_in_scope is not None else list(ALL_PROVIDERS)
+    client = _client()
+
+    complaint_scope = [p for p in scope if p in COMPLAINT_PROVIDERS]
+    run = LeakRun(providers_requested=scope)
+    if not complaint_scope:
+        run.errors["*"] = "no complaint-side provider in scope: nothing to examine"
+        return run
+
+    with ThreadPoolExecutor(max_workers=len(complaint_scope)) as pool:
+        loads = list(
+            pool.map(lambda p: load_documents_result(p, client=client), complaint_scope)
+        )
+
+    complaints: list[Document] = []
+    for load in loads:
+        if not load.ok:
+            run.errors[load.provider] = load.error
+            continue
+        run.complaint_providers_read.append(load.provider)
+        if load.unreadable:
+            run.errors[load.provider] = (
+                f"{load.unreadable} document(s) enumerated but could not be inspected"
+            )
+        if not load.present:
+            run.complaint_providers_absent.append(load.provider)
+        elif not load.documents:
+            run.complaint_providers_empty.append(load.provider)
+        complaints.extend(load.documents)
+
+    run.complaints_examined = len(complaints)
+    if not complaints:
+        return run
+
+    with ThreadPoolExecutor(max_workers=min(len(complaints), MAX_WORKERS)) as pool:
+        verdicts = list(
+            pool.map(
+                lambda c: evaluate(
+                    c,
+                    scope,
+                    registry,
+                    profile,
+                    client=client,
+                    complaint_providers_read=run.complaint_providers_read,
+                ),
+                complaints,
+            )
+        )
+
+    merged = _merge_clusters(verdicts)
+    order = {"leak": 0, "unknown": 1, "resolved": 2}
+    run.verdicts = sorted(
+        merged, key=lambda v: (order.get(v.verdict, 3), -(v.confidence or 0.0))
+    )
+    return run
+
+
 def detect_leaks(
     providers_in_scope: Optional[list[str]] = None,
     profile: Optional[IntentProfile] = None,
@@ -588,29 +922,20 @@ def detect_leaks(
 
     `providers_in_scope` is the kill-shot handle: pass every provider for the
     full answer, or a subset to watch it degrade.
+
+    Raises `SourceUnavailable` when no complaint source could be read at all,
+    so that an empty list only ever means "read them, found nothing". Callers
+    that would rather handle the difference than catch it should use
+    `detect_leaks_run`.
     """
-    profile = profile or get_profile()
-    registry = registry or ConnectorRegistry()
-    scope = list(providers_in_scope) if providers_in_scope is not None else list(ALL_PROVIDERS)
-    client = _client()
-
-    complaint_scope = [p for p in scope if p in COMPLAINT_PROVIDERS]
-    complaints: list[Document] = []
-    if complaint_scope:
-        with ThreadPoolExecutor(max_workers=len(complaint_scope)) as pool:
-            for batch in pool.map(lambda p: load_documents(p, client=client), complaint_scope):
-                complaints.extend(batch)
-    if not complaints:
-        return []
-
-    with ThreadPoolExecutor(max_workers=min(len(complaints), MAX_WORKERS)) as pool:
-        verdicts = list(
-            pool.map(lambda c: evaluate(c, scope, registry, profile, client=client), complaints)
+    run = detect_leaks_run(providers_in_scope, profile=profile, registry=registry)
+    if not run.grounded:
+        detail = "; ".join(f"{p}: {e}" for p, e in sorted(run.errors.items()))
+        raise SourceUnavailable(
+            f"no complaint source could be read for scope "
+            f"{run.providers_requested}: {detail or 'no reason reported'}"
         )
-
-    merged = _merge_clusters(verdicts)
-    order = {"leak": 0, "unknown": 1, "resolved": 2}
-    return sorted(merged, key=lambda v: (order.get(v.verdict, 3), -(v.confidence or 0.0)))
+    return run.verdicts
 
 
 # --- interop with the 8-node pipeline ----------------------------------------
