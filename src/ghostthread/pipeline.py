@@ -248,6 +248,10 @@ class GhostThread:
             live.append("memory_read/memory_write (N1/N7)")
         return live
 
+    def backends_memory(self) -> str:
+        """What N1/N7 are actually running on. `/health` and the UI both show it."""
+        return "stub" if memory.IS_STUB else self.grounding.backend
+
     def resolve_one(
         self,
         leak: LeakResult,
@@ -324,7 +328,7 @@ class GhostThread:
                 "grounding": self.grounding.backend,
                 "extraction": self.extractor.backend,
                 "intent_profile": profile.origin,
-                "memory": "stub" if memory.IS_STUB else self.grounding.backend,
+                "memory": self.backends_memory(),
                 # N8. "in-process" means the dedupe does not survive a restart
                 # and does not span instances -- said plainly, not implied.
                 "idempotency": self.action_log.backend,

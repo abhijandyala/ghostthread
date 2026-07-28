@@ -15,8 +15,8 @@ make demo      # serves the UI on http://127.0.0.1:8000
 ```
 
 1. **State the question.** It is printed at the top of the UI.
-2. **Answer it.** Hit *Run across all four sources*. Six leaks, each with the signal breakdown that produced the verdict, the extracted facts, and the action taken.
-3. **Break it.** Hit *Run the kill shot*. The same question is re-asked with fewer connectors:
+2. **Answer it.** All four connector toggles are on. Hit *Run across all four sources*. Six leaks, each with the signal breakdown that produced the verdict, the extracted facts, the routing decision and the sentence explaining it, and the action taken. The memory panel shows what was known about each reporter beforehand, and the cost counter shows what the run actually spent.
+3. **Break it.** Uncheck a connector and re-run — the toggles are the `sources` list threaded down to the retrieval query, so an unchecked source is genuinely never read. Or hit *Run the kill shot* for the whole ladder at once:
 
 | sources | answerable | leaks reported | false leaks | invisible | F1 |
 |---|---|---|---|---|---|

@@ -17,6 +17,7 @@ from .contracts import ComplaintEvent
 from .intent import get_profile, push_profile
 from .killshot import DEFAULT_SCOPES, run_killshot
 from .pipeline import GhostThread
+from .router import validate_policy
 
 app = FastAPI(title="GhostThread", version="1.0")
 app.add_middleware(
@@ -48,6 +49,12 @@ class KillshotRequest(BaseModel):
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    """Everything a viewer needs to know what is real before anything is run.
+
+    Stubs, policy problems and the idempotency backend are here as well as on
+    every RunReport, so the UI can show them on page load rather than only after
+    someone happens to press Run.
+    """
     profile = get_profile()
     return {
         "ok": True,
@@ -56,7 +63,12 @@ def health() -> dict[str, Any]:
             "grounding": engine.grounding.backend,
             "extraction": engine.extractor.backend,
             "intent_profile": profile.origin,
+            "memory": engine.backends_memory(),
+            "idempotency": engine.action_log.backend,
         },
+        "stubs": engine.stubs(),
+        "policy_problems": validate_policy(profile),
+        "idempotency": engine.action_log.status(),
     }
 
 
