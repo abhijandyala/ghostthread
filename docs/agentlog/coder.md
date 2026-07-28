@@ -372,3 +372,134 @@ chunk against a silently wrong answer.
   ungrounded run it will still draw a table of zeros with the refusal only in
   the headline text. Track B should grey the table out when `grounded` is
   false; the data is there.
+
+## 2026-07-28 13:35 — A4, the Track A eval suite
+
+**Task:** build the phase A4 eval suite. Files created:
+`src/ghostthread/eval_suite.py`, `scripts/eval.py`, `fixtures/eval_cases.json`.
+One line added to the `Makefile` (`eval` target + `.PHONY`). Nothing else
+touched; `contracts.py`, `memory.py`, `killshot.py` and `knowledge_query.py`
+were read only.
+
+**Did:**
+
+The constraint that shaped everything: the tenant holds noise. 23 complaint
+documents that are Google security alerts, Linear onboarding notices and
+"testing" Slack messages; GitHub has a connector but zero documents; nothing
+resolves; `SEED.md` is not seeded. A table of "complaint X must be a leak" would
+have been unrunnable today and stale the moment the tenant changes, and an eval
+that cannot run is worse than none because its silence reads as approval. So the
+suite is two layers plus a set of negative controls.
+
+*Layer 1, ten invariants.* Properties of the system rather than of the data, so
+they hold on an empty tenant, on the seeded one, and on whatever is there next
+week:
+
+- three separate checks that a complaint-side-only scope (`slack`, `gmail`,
+  `slack+gmail`) makes every verdict `unknown` with `confidence is None`. This
+  is the graded kill-shot claim, checked per scope because each fails for its
+  own reason.
+- a narrower scope never reports more resolved complaints than the full-scope
+  run. Five subsets are compared. This is the property a display-filter kill
+  shot satisfies trivially and a genuinely re-scoped query has to earn.
+- `resolved` always carries at least one `matched_work_items` entry, `leak`
+  carries none.
+- `sources_used` and `sources_missing` are disjoint and every id in them is a
+  real connector id read from `ConnectorRegistry`.
+- `confidence is None` if and only if `verdict == "unknown"`.
+- a freshly generated actor with a freshly generated topic reads back zeros and
+  tone `first_contact`.
+- `memory_read` with `HYDRA_TOKEN` blanked returns an honest empty result rather
+  than raising or inventing counts.
+- with the credential blanked, `detect_leaks` raises `SourceUnavailable` *and*
+  `detect_leaks_run` returns `grounded=False` with per-provider reasons and no
+  verdicts. Both halves asserted: the raise is what makes an empty list mean
+  "read them, found nothing", and the run is what lets a UI degrade instead of
+  crashing.
+
+The last three shape checks walk every verdict from every scope the suite ran —
+115 verdicts across 6 scopes on the current tenant — rather than only the
+reference run.
+
+*Layer 2, `fixtures/eval_cases.json`.* Schema plus two illustrative entries with
+placeholder complaint ids. A case whose `complaint_id` is not in the tenant is
+SKIPPED with the complaint id quoted, never passed. Data rather than Python for
+two reasons: `verify_no_hardcoding.py` scans `src/` for demo entity names and
+would rightly fail this file if it named one, and the table has to be fillable
+by whoever seeds `SEED.md` without editing code.
+
+*Negative controls.* Three defined, two runnable against this tenant:
+
+- `ctl.bogus_connector_id` — query the work collections with a freshly
+  generated UUID as `connector_id`. The real id returns 4 candidates, the
+  generated one returns 0. This is the check that the kill shot's honesty rests
+  on: if a made-up id still returned hits, the metadata filter would be inert
+  and every scoped row would be a display filter wearing a costume.
+- `ctl.semantic_floor_moves_scores` — drop `semantic_floor` to 0 and assert
+  calibrated scores rise. 4 of 4 rose. A score indifferent to the one profile
+  knob that touches every score is not being calibrated against the profile.
+- `ctl.unreachable_match_threshold` — raise `match_threshold` to
+  `math.nextafter(1.0, inf)`, which `evaluate`'s clamped score can never reach,
+  and assert every resolution flips to leak. Skipped today: the tenant resolves
+  nothing, so there is no resolution to break. Derived rather than written as a
+  literal, because a threshold this file invented is the thing the project
+  claims not to do.
+
+*Three states, kept apart.* `pass`, `fail`, `skip`. The count line prints all
+three and the banner adds "a skip is not a pass: the data those checks need is
+not in the tenant, so they proved nothing either way". With an empty tenant this
+is the whole point — 12 passed / 0 failed / 3 skipped must not read as 15 green.
+
+The suite never writes to the tenant. Both memory probes use a uuid-derived
+actor, topic and complaint id, so the actor-filtered and the topical query both
+have to come back empty; a nonzero count there is an invented one.
+
+**Verified:** (live tenant, `DRY_RUN=true`, `.venv/bin/python`, `PYTHONPATH=src`)
+
+- `scripts/eval.py` exit 0: 12 passed, 0 failed, 3 skipped. `grounded=True`,
+  profile origin `insforge`, 23 complaints / 23 clusters / 0 resolved,
+  ~24s wall.
+- `scripts/smoke.py --demo-ready` exit 0, 5/5 PASS, no stubs, 14 complaints /
+  14 actions, `backends.grounding=hydradb`.
+- `scripts/verify_no_hardcoding.py` exit 0, 3/3 PASS — including "no demo entity
+  names in source" with `eval_suite.py` now inside `src/`.
+- **The eval was proven able to fail.** Two regressions injected at runtime from
+  a scratch file outside the repo (never committed, since deleted): `evaluate`
+  wrapped to turn every `unknown` into `leak` with confidence 0.9, and
+  `search_work` wrapped to drop `use_connector_filter`. Result: exit 1, 8
+  passed / 4 failed / 3 skipped. All three `inv.refuses_without_work_source.*`
+  rows failed with "18/5/23 verdict(s) were not unknown and carried a
+  confidence; with no work-side connector in scope the system must refuse, not
+  answer", and `ctl.bogus_connector_id` failed with "5 candidate(s) came back
+  under a connector id that exists nowhere; the connector filter is not scoping
+  the query". Un-patched and re-run: exit 0, 12/0/3 again.
+- Tenant left clean: collections are `github, gmail, linear, slack`, the
+  `memories` collection does not exist, 0 memory rows.
+
+**Left undone / for others:**
+
+- **`ctl.unreachable_match_threshold` has never actually executed**, because
+  nothing in this tenant resolves. It is written and it skips honestly, but its
+  own correctness is unproven until something resolves. Whoever seeds `SEED.md`
+  should re-run `make eval` and confirm that row goes PASS rather than SKIP —
+  if it stays SKIP after seeding, that is itself a finding about the matcher.
+- Layer 2 is two placeholder rows. Both skip. Filling
+  `fixtures/eval_cases.json` with real complaint ids after seeding is the
+  remaining A4 work and needs no code change.
+- The suite issues 6 full `detect_leaks_run` sweeps and takes ~24s. Acceptable
+  for a pre-rehearsal check, too slow for CI on every commit. The document cache
+  carries most of it; the per-complaint work queries are the cost.
+- `check_leaks_without_credential` calls `refresh_documents()` on the way in and
+  out, so any caller running the suite inside a longer-lived process pays a cold
+  document read afterwards. Necessary: a warm cache answers from the last good
+  read and the check would pass without ever going near the blanked credential.
+- The complaint count moved from 16 to 23 between two runs a few minutes apart
+  while I was testing. The connectors are live-syncing, so eval numbers are not
+  stable across runs — another reason layer 1 asserts on properties rather than
+  counts.
+- `eval_suite.py` is not in `verify_no_hardcoding.py`'s `DECISION_MODULES`, same
+  as `killshot.py` and `knowledge_query.py`. I checked it by hand against the
+  same AST rule: the only float literals are `NO_SEMANTIC_FLOOR = 0.0` and
+  `math.nextafter(1.0, math.inf)`, neither of which appears in a comparison.
+  Adding the file to that list is a one-line change to a script I was not
+  scoped to touch.
