@@ -23,8 +23,13 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ghostthread import config  # noqa: E402
+from ghostthread import actions_log, config  # noqa: E402
 from ghostthread.intent import push_profile  # noqa: E402
+
+# The actions_log schema lives in the library, not here. A schema that only a
+# script knows about is a schema the code cannot check itself against -- which is
+# how the table went missing while the run report still claimed InsForge.
+column = actions_log.column
 
 
 def headers() -> dict[str, str]:
@@ -35,60 +40,9 @@ def headers() -> dict[str, str]:
     }
 
 
-def col(name: str, type_: str, nullable: bool = True, unique: bool = False) -> dict:
-    # The live API uses columnName/isNullable/isUnique, not the name/nullable/
-    # unique spelling the published docs show. All three keys are required.
-    return {
-        "columnName": name,
-        "type": type_,
-        "isNullable": nullable,
-        "isUnique": unique,
-    }
-
-
 PROFILE_COLUMNS = [
-    col("key", "string", nullable=False, unique=True),
-    col("value", "json", nullable=False),
-]
-
-# Mirrors the PRD schema, and 1:1 onto ResolutionAction's field names -- see
-# actions_log.row_from_resolution. `complaint_id` UNIQUE is the idempotency key
-# and the only column the guarantee actually depends on; `resolution` carries the
-# full outcome so a replay re-renders the original rather than recomputing it.
-# The rest are flat mirrors so the memory dashboard can be plain SQL.
-ACTIONS_COLUMNS = [
-    col("complaint_id", "string", nullable=False, unique=True),
-    col("received_at", "string"),
-    col("source", "string"),
-    col("actor_resolved", "string"),
-    col("complaint_text", "string"),
-    col("category", "string"),
-    col("confidence", "float"),
-    col("reply_tone", "string"),
-    col("times_reported_actor", "integer"),
-    col("times_seen_topic", "integer"),
-    col("regression_evidence", "string"),
-    col("verdict", "string"),
-    col("verdict_confidence", "float"),
-    col("actions_taken", "json"),
-    col("ticket_url", "string"),
-    col("pr_url", "string"),
-    col("pr_confidence", "float"),
-    col("reply_sent", "boolean"),
-    col("escalated", "boolean"),
-    col("cost_usd", "float"),
-    col("latency_ms", "float"),
-    col("dry_run", "boolean"),
-    col("resolution", "json"),
-]
-
-# If the extended column types are rejected, this is the smallest table that
-# still delivers the guarantee. actions_log.py writes the reduced shape on a
-# schema rejection, so a project provisioned this way still dedupes correctly --
-# it just loses the flat dashboard columns.
-MINIMAL_ACTIONS_COLUMNS = [
-    col("complaint_id", "string", nullable=False, unique=True),
-    col("resolution", "json"),
+    column("key", "string", nullable=False, unique=True),
+    column("value", "json", nullable=False),
 ]
 
 
@@ -109,17 +63,24 @@ def create_table(table: str, columns: list[dict]) -> bool:
 
 
 def create_actions_log() -> bool:
-    """Full schema first, then the minimal one the guarantee actually needs.
+    """Provision N8's table, then read it back to prove it is actually usable.
 
-    The full schema uses column types beyond the string/json pair the live API is
-    known to accept, so a rejection here is a real possibility rather than a
-    theoretical one. Falling back to two columns keeps idempotency working; what
-    is lost is only the dashboard's flat columns, and the retry says so.
+    `provision()` tries the full schema and falls back to the two columns the
+    guarantee actually needs. The read-back matters more than the create: a
+    create that reports success and a table that answers 404 look identical from
+    here, and that gap is what let the idempotency backend regress unnoticed.
     """
-    if create_table(config.INSFORGE_ACTIONS_TABLE, ACTIONS_COLUMNS):
+    created, detail = actions_log.provision()
+    print(f"table {config.INSFORGE_ACTIONS_TABLE}: {detail}")
+    if not created:
+        return False
+
+    result = actions_log.probe()
+    if result.ok:
+        print(f"table {config.INSFORGE_ACTIONS_TABLE}: readable, idempotency is durable")
         return True
-    print("  retrying with the minimal complaint_id + resolution schema")
-    return create_table(config.INSFORGE_ACTIONS_TABLE, MINIMAL_ACTIONS_COLUMNS)
+    print(f"table {config.INSFORGE_ACTIONS_TABLE}: NOT readable -- {result.reason}")
+    return False
 
 
 def main() -> int:

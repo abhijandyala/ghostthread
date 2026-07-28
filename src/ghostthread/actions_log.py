@@ -24,12 +24,26 @@ rather than presented as equivalent.
 The read order is InsForge first, then the local mirror. The mirror is always
 written, so a run that loses InsForge halfway through still dedupes against what
 it already did in this process instead of starting over.
+
+Why there is a preflight
+------------------------
+Having credentials is not the same as having a table. An unprovisioned project
+answers every read with `404 42P01 relation "public.actions_log" does not exist`,
+which used to surface as the generic reason "read failed: HTTPStatusError" *after*
+the first complaint had already been processed -- so the run reported the InsForge
+backend right up until it silently stopped being true, and the reason it gave was
+indistinguishable from a network outage.
+
+So construction probes the table before claiming anything, an absent table is
+created rather than treated as an outage (a missing table is a misprovisioned
+project, not an unavailable one), and every degradation reason now carries the
+HTTP status and PostgREST error code that caused it.
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import httpx
 
@@ -41,10 +55,15 @@ from .contracts import ResolutionAction
 RESOLUTION_COLUMN = "resolution"
 KEY_COLUMN = "complaint_id"
 
-# Flat columns mirrored out of the resolution for the memory dashboard and for
-# anyone querying the table by hand. The JSON column is the source of truth for
-# replay; these exist so `recurring_reporters` and friends can be plain SQL.
 _TIMEOUT = 8.0
+# Construction blocks on this, and construction happens at API import time, so it
+# is deliberately shorter than the request timeout.
+_PREFLIGHT_TIMEOUT = 5.0
+_PROVISION_TIMEOUT = 20.0
+
+# PostgREST surfaces Postgres' SQLSTATE. 42P01 is undefined_table -- the one
+# failure that means "provision me", not "I am down".
+UNDEFINED_TABLE = "42P01"
 
 
 def _headers() -> dict[str, str]:
@@ -62,8 +81,163 @@ def _records_url() -> str:
     return f"{base}/api/database/records/{config.INSFORGE_ACTIONS_TABLE}"
 
 
+def _tables_url() -> str:
+    base = config.INSFORGE_BASE_URL.rstrip("/")
+    return f"{base}/api/database/tables"
+
+
 def insforge_configured() -> bool:
     return bool(config.INSFORGE_BASE_URL and config.INSFORGE_API_KEY)
+
+
+# --- the schema ---------------------------------------------------------------
+# Declared here rather than in scripts/seed_insforge.py because the writer, the
+# reader and the provisioner all have to agree on it, and a schema that lives in
+# a script is a schema the library cannot check itself against.
+
+
+def column(name: str, type_: str, nullable: bool = True, unique: bool = False) -> dict[str, Any]:
+    """One column, in the shape the live API actually accepts.
+
+    It uses columnName/isNullable/isUnique, not the name/nullable/unique spelling
+    the published docs show. All three keys are required.
+    """
+    return {
+        "columnName": name,
+        "type": type_,
+        "isNullable": nullable,
+        "isUnique": unique,
+    }
+
+
+# Mirrors the PRD schema and maps 1:1 onto ResolutionAction's field names -- see
+# row_from_resolution below. `complaint_id` UNIQUE is the idempotency key and the
+# only column the guarantee depends on; `resolution` carries the full outcome so a
+# replay re-renders the original rather than recomputing it. The rest are flat
+# mirrors so the memory dashboard can be plain SQL.
+ACTIONS_COLUMNS: list[dict[str, Any]] = [
+    column(KEY_COLUMN, "string", nullable=False, unique=True),
+    column("received_at", "string"),
+    column("source", "string"),
+    column("actor_resolved", "string"),
+    column("complaint_text", "string"),
+    column("category", "string"),
+    column("confidence", "float"),
+    column("reply_tone", "string"),
+    column("times_reported_actor", "integer"),
+    column("times_seen_topic", "integer"),
+    column("regression_evidence", "string"),
+    column("verdict", "string"),
+    column("verdict_confidence", "float"),
+    column("actions_taken", "json"),
+    column("ticket_url", "string"),
+    column("pr_url", "string"),
+    column("pr_confidence", "float"),
+    column("reply_sent", "boolean"),
+    column("escalated", "boolean"),
+    column("cost_usd", "float"),
+    column("latency_ms", "float"),
+    column("dry_run", "boolean"),
+    column(RESOLUTION_COLUMN, "json"),
+]
+
+# If the extended column types are ever rejected, this is the smallest table that
+# still delivers the guarantee. `_insert` writes the reduced shape on a schema
+# rejection, so a project provisioned this way still dedupes correctly -- it just
+# loses the flat dashboard columns.
+MINIMAL_ACTIONS_COLUMNS: list[dict[str, Any]] = [
+    column(KEY_COLUMN, "string", nullable=False, unique=True),
+    column(RESOLUTION_COLUMN, "json"),
+]
+
+
+# --- talking to InsForge without losing the reason ----------------------------
+
+
+def describe(resp: httpx.Response) -> str:
+    """The status plus whatever PostgREST said, instead of an exception class.
+
+    "read failed: HTTPStatusError" and "HTTP 404: 42P01 relation
+    "public.actions_log" does not exist" are the same event; only one of them
+    tells you what to do about it.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        parts = [str(body[k]) for k in ("code", "message", "details") if body.get(k)]
+        if parts:
+            return f"HTTP {resp.status_code}: {' '.join(parts)[:200]}"
+    return f"HTTP {resp.status_code}: {resp.text[:160]}"
+
+
+def _is_missing_table(resp: httpx.Response) -> bool:
+    if resp.status_code not in (400, 404):
+        return False
+    body = resp.text
+    return UNDEFINED_TABLE in body or "does not exist" in body.lower()
+
+
+class Probe(NamedTuple):
+    """Whether the table is genuinely usable, and if not, precisely why."""
+
+    ok: bool
+    reason: str = ""
+    missing_table: bool = False
+
+
+def probe() -> Probe:
+    """One cheap read against the real table. No side effects."""
+    if not insforge_configured():
+        return Probe(False, "InsForge not configured; idempotency is in-process only")
+    try:
+        resp = httpx.get(
+            _records_url(),
+            params={"limit": "1"},
+            headers=_headers(),
+            timeout=_PREFLIGHT_TIMEOUT,
+        )
+    except Exception as exc:
+        return Probe(False, f"InsForge unreachable ({type(exc).__name__})")
+    if resp.is_success:
+        return Probe(True)
+    if _is_missing_table(resp):
+        return Probe(
+            False,
+            f"table {config.INSFORGE_ACTIONS_TABLE!r} does not exist ({describe(resp)})",
+            missing_table=True,
+        )
+    if resp.status_code in (401, 403):
+        return Probe(False, f"InsForge rejected the credential ({describe(resp)})")
+    return Probe(False, f"InsForge read failed ({describe(resp)})")
+
+
+def provision() -> tuple[bool, str]:
+    """Create the table. Full schema first, then the two columns that matter.
+
+    Idempotent: an existing table is reported as existing, never recreated.
+    Returns (table exists afterwards, what happened).
+    """
+    if not insforge_configured():
+        return False, "InsForge not configured"
+    detail = "no attempt made"
+    for columns, label in ((ACTIONS_COLUMNS, "full"), (MINIMAL_ACTIONS_COLUMNS, "minimal")):
+        try:
+            resp = httpx.post(
+                _tables_url(),
+                headers=_headers(),
+                json={"tableName": config.INSFORGE_ACTIONS_TABLE, "columns": columns},
+                timeout=_PROVISION_TIMEOUT,
+            )
+        except Exception as exc:
+            return False, f"create failed: {type(exc).__name__}"
+        if resp.is_success:
+            return True, f"created with the {label} schema ({len(columns)} columns)"
+        if "already exists" in resp.text:
+            return True, "already existed"
+        detail = describe(resp)
+    return False, detail
 
 
 def row_from_resolution(complaint_id: str, resolution: ResolutionAction) -> dict[str, Any]:
@@ -113,13 +287,31 @@ class ActionsLog:
     exact case this exists to handle.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, auto_provision: Optional[bool] = None) -> None:
         self._lock = threading.Lock()
         self._mirror: dict[str, dict[str, Any]] = {}
-        self._live = insforge_configured()
-        self.degraded_reason = (
-            "" if self._live else "InsForge not configured; idempotency is in-process only"
-        )
+        if auto_provision is None:
+            auto_provision = config.INSFORGE_AUTO_PROVISION
+
+        result = probe()
+        if not result.ok and result.missing_table and auto_provision:
+            # A table that was never created is a misprovisioned project, not an
+            # unavailable one, and silently downgrading the guarantee because
+            # nobody remembered to run the seed script is exactly the failure
+            # this class exists to make impossible.
+            created, detail = provision()
+            result = (
+                probe()
+                if created
+                else Probe(
+                    False,
+                    f"{result.reason} and could not be created ({detail}); "
+                    f"run scripts/seed_insforge.py",
+                )
+            )
+
+        self._live = result.ok
+        self.degraded_reason = result.reason if not result.ok else ""
 
     # -- status ---------------------------------------------------------------
 
@@ -197,10 +389,24 @@ class ActionsLog:
                 headers=_headers(),
                 timeout=_TIMEOUT,
             )
-            resp.raise_for_status()
-            rows = resp.json()
         except Exception as exc:
             self._fall_back(f"read failed: {type(exc).__name__}")
+            return None
+
+        if not resp.is_success:
+            # The preflight passed, so a missing table now means it was dropped
+            # underneath a running process. Say that, rather than reporting the
+            # same "read failed" a timeout would produce.
+            if _is_missing_table(resp):
+                self._fall_back(f"table disappeared mid-run ({describe(resp)})")
+            else:
+                self._fall_back(f"read rejected ({describe(resp)})")
+            return None
+
+        try:
+            rows = resp.json()
+        except Exception as exc:
+            self._fall_back(f"read returned unparseable body: {type(exc).__name__}")
             return None
         if not rows:
             return None
@@ -244,7 +450,7 @@ class ActionsLog:
         if _is_unique_violation(retry):
             return {"written": False, "duplicate": True}
 
-        self._fall_back(f"write rejected: HTTP {resp.status_code}")
+        self._fall_back(f"write rejected ({describe(resp)})")
         return {"written": False, "error": resp.text[:200]}
 
 

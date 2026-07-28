@@ -48,6 +48,10 @@ INSFORGE_PROFILE_KEY = os.getenv("INSFORGE_PROFILE_KEY", "ghostthread")
 # Pipeline node N8. UNIQUE on complaint_id is what makes a retried webhook safe
 # across instances; see actions_log.py.
 INSFORGE_ACTIONS_TABLE = os.getenv("INSFORGE_ACTIONS_TABLE", "actions_log")
+# An absent actions_log table is a misprovisioned project, not an outage, and
+# silently downgrading the idempotency guarantee over it is the regression this
+# flag exists to prevent. Set false to require scripts/seed_insforge.py instead.
+INSFORGE_AUTO_PROVISION = _flag("INSFORGE_AUTO_PROVISION", default=True)
 INTENT_PROFILE_TTL_SECONDS = float(os.getenv("INTENT_PROFILE_TTL_SECONDS", "5"))
 LOCAL_PROFILE_PATH = Path(
     os.getenv("LOCAL_PROFILE_PATH", REPO_ROOT / "insforge" / "intent_profile.json")
