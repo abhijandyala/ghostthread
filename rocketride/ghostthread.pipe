@@ -1,8 +1,14 @@
 {
+  "description": "GhostThread: find the customer complaints that never became tracked work. Webhook -> RocketRide agent -> HTTP tool against the GhostThread service -> answers. The heavy lifting lives behind tool_http_request because tool_python's sandbox blocks imports and hydradb-sdk cannot run inside a managed node; RocketRide owns orchestration, the agent loop, tool routing and the public endpoint.",
+  "version": 1,
+  "project_id": "ghostthread",
+  "source": "webhook_1",
   "components": [
     {
       "id": "webhook_1",
       "provider": "webhook",
+      "name": "Inbound complaint",
+      "description": "Public trigger. The demo UI's live input box and any judge with curl POST here; in production this is where Slack Events and Gmail push fan in.",
       "config": {
         "hideForm": true,
         "mode": "Source",
@@ -13,47 +19,71 @@
     {
       "id": "agent_1",
       "provider": "agent_rocketride",
+      "name": "GhostThread operator",
+      "description": "Plans the run, calls the GhostThread service over HTTP, and reports both the leak set and the degradation ladder verbatim.",
       "config": {
-        "type": "agent_rocketride",
-        "parameters": {
-          "system": "You are GhostThread's operator. Given an inbound trigger, call the ghostthread_run tool to detect complaints that never became tracked work, then call ghostthread_killshot to measure how the answer degrades when sources are removed. Return both results verbatim."
-        }
+        "agent_description": "Finds customer complaints in Slack and Gmail that never became tracked work in Linear or GitHub, acts on them, and measures how much worse the answer gets when connectors are removed.",
+        "instructions": [
+          "You operate GhostThread. The service is reachable at ${ROCKETRIDE_GHOSTTHREAD_URL}. Use the ghostthread_service HTTP tool for every call; you have no other way to reach it.",
+          "For an inbound complaint or a bare trigger, POST ${ROCKETRIDE_GHOSTTHREAD_URL}/run with Content-Type: application/json and the body {\"sources\": null, \"act\": true}. A null source list means all four connectors. Report the leaks, each verdict's signal breakdown, and the action taken for each.",
+          "If the trigger carries a specific complaint written by a person, POST ${ROCKETRIDE_GHOSTTHREAD_URL}/complaint instead, with {\"text\": <their message>, \"source\": \"slack\"}. That runs the identical pipeline over the one message.",
+          "Then POST ${ROCKETRIDE_GHOSTTHREAD_URL}/killshot with an empty JSON body {} to measure how the same question degrades as connectors are removed, and report that table too.",
+          "Report exactly what the service returned. Do not summarise a verdict into a different verdict, do not fill in a confidence the service did not give you, and never state that a complaint was tracked or resolved unless a matched work item came back in the response. A verdict of unknown_insufficient_sources means the answer could not be grounded and must be reported as unknown, not as 'no leaks found'.",
+          "If a call fails or the service is unreachable, say so plainly and stop. Do not answer the question from your own knowledge -- you do not have the data, and a plausible answer here is worse than no answer."
+        ],
+        "max_waves": 8
       },
       "input": [
-        { "lane": "text", "from": "webhook_1" }
+        { "lane": "questions", "from": "webhook_1" }
       ]
     },
     {
-      "id": "tool_run",
-      "provider": "tool_http_request",
+      "id": "llm_1",
+      "provider": "llm_anthropic",
+      "name": "Agent planner",
+      "description": "The agent's planning and synthesis model. Required: agent_rocketride declares invoke.llm with min 1, max 1. The key resolves from the RocketRide account environment, never from this file.",
       "config": {
-        "type": "tool_http_request",
-        "parameters": {
-          "name": "ghostthread_run",
-          "description": "Detect complaints in Slack and Gmail with no matching Linear or GitHub work, and act on them.",
-          "method": "POST",
-          "url": "${ROCKETRIDE_GHOSTTHREAD_URL}/run",
-          "headers": { "Content-Type": "application/json" },
-          "body": "{\"sources\": null, \"act\": true}"
+        "profile": "claude-sonnet-4-6",
+        "claude-sonnet-4-6": {
+          "apikey": "${ROCKETRIDE_ANTHROPIC_KEY}"
         }
       },
       "control": [
-        { "classType": "tool", "from": "agent_1" }
+        { "classType": "llm", "from": "agent_1" }
       ]
     },
     {
-      "id": "tool_killshot",
+      "id": "memory_1",
+      "provider": "memory_internal",
+      "name": "Agent scratch memory",
+      "description": "The agent's own working memory across planning waves. Required: agent_rocketride declares invoke.memory with min 1, max 1. This is NOT the product's memory -- the customer history the pitch is about lives in HydraDB, behind the service.",
+      "config": {
+        "type": "memory_internal"
+      },
+      "control": [
+        { "classType": "memory", "from": "agent_1" }
+      ]
+    },
+    {
+      "id": "tool_http_1",
       "provider": "tool_http_request",
+      "name": "ghostthread_service",
+      "description": "The only way out of this pipeline. POST /run detects leaks across all four connectors and acts on them, POST /killshot returns the degradation ladder, POST /complaint runs one live message, GET /health reports which integrations are live versus degraded, GET /memory_dashboard returns recurring reporters from the InsForge actions log.",
       "config": {
         "type": "tool_http_request",
-        "parameters": {
-          "name": "ghostthread_killshot",
-          "description": "Re-run the same question against progressively fewer connectors and report the degradation.",
-          "method": "POST",
-          "url": "${ROCKETRIDE_GHOSTTHREAD_URL}/killshot",
-          "headers": { "Content-Type": "application/json" },
-          "body": "{}"
-        }
+        "allowGET": true,
+        "allowPOST": true,
+        "allowPUT": false,
+        "allowPATCH": false,
+        "allowDELETE": false,
+        "allowHEAD": false,
+        "allowOPTIONS": false,
+        "urlWhitelist": [
+          { "whitelistPattern": "^${ROCKETRIDE_GHOSTTHREAD_URL}/" }
+        ],
+        "rateLimitPerSecond": 4,
+        "rateLimitPerMinute": 60,
+        "maxConcurrentRequests": 4
       },
       "control": [
         { "classType": "tool", "from": "agent_1" }
@@ -61,14 +91,16 @@
     },
     {
       "id": "response_1",
-      "provider": "response_text",
-      "config": { "laneName": "text" },
+      "provider": "response_answers",
+      "name": "Result",
+      "description": "Returns the agent's answers lane to the HTTP caller.",
+      "config": {
+        "laneName": "answers"
+      },
       "input": [
-        { "lane": "text", "from": "agent_1" }
+        { "lane": "answers", "from": "agent_1" }
       ]
     }
   ],
-  "project_id": "9f2c4d18-6b03-4a7e-9c51-2ad8f0e7b431",
-  "viewport": { "x": 0, "y": 0, "zoom": 1 },
-  "version": 1
+  "viewport": { "x": 0, "y": 0, "zoom": 1 }
 }

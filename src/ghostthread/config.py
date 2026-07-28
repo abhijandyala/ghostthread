@@ -101,6 +101,19 @@ HYDRA_LOOKBACK_DAYS = int(os.getenv("HYDRA_LOOKBACK_DAYS", "30"))
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "")  # "owner/name"
 
+# --- RocketRide Cloud (managed pipeline) ------------------------------------
+ROCKETRIDE_URI = os.getenv("ROCKETRIDE_URI", "https://api.rocketride.ai")
+ROCKETRIDE_APIKEY = os.getenv("ROCKETRIDE_APIKEY", "")
+# The public URL of *this* service, as RocketRide's tool_http_request node must
+# be able to reach it. It is not a literal in ghostthread.pipe: the pipeline
+# refers to ${ROCKETRIDE_GHOSTTHREAD_URL} and the engine resolves that from the
+# RocketRide account environment at run time, so rotating the tunnel is an
+# account setting rather than a code change. Set locally too, for the scripts
+# that print or check the endpoint.
+ROCKETRIDE_GHOSTTHREAD_URL = os.getenv("ROCKETRIDE_GHOSTTHREAD_URL", "")
+# Port the public tunnel points at. scripts/serve_public.py binds it.
+PUBLIC_PORT = int(os.getenv("PUBLIC_PORT", "8000"))
+
 # --- Safety -----------------------------------------------------------------
 # Default ON. Nothing leaves the building until a human flips this.
 DRY_RUN = _flag("DRY_RUN", default=True)
