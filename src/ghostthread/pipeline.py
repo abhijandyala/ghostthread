@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from . import act, config, connectors, memory, router
+from .events import emit
 from .contracts import (
     ALL_SOURCES,
     ComplaintEvent,
@@ -257,13 +258,75 @@ class GhostThread:
         scope: list[str],
     ) -> ResolutionAction:
         """N1 -> N7 for a single complaint, in order."""
+        cid = complaint.id
+
+        emit("agent_step", complaint_id=cid, step="memory_read", status="running")
         recalled = node_memory_read(complaint, scope, profile, self.grounding)
+        emit(
+            "agent_step",
+            complaint_id=cid,
+            step="memory_read",
+            status="done",
+            detail=f"{recalled.times_reported_by_actor} prior reports from this actor",
+        )
+
+        emit("agent_step", complaint_id=cid, step="classify", status="running")
         facts = node_classify(complaint, recalled, profile, self.extractor)
+        emit(
+            "agent_step",
+            complaint_id=cid,
+            step="classify",
+            status="done",
+            detail=facts.category,
+            what_broke=facts.what_broke,
+            severity=facts.severity,
+            is_code_issue=facts.is_code_issue,
+        )
+
+        emit("agent_step", complaint_id=cid, step="route", status="running")
         decision = node_route(facts, profile)
+        emit(
+            "agent_step",
+            complaint_id=cid,
+            step="route",
+            status="done",
+            detail=", ".join(decision.actions) or decision.reason,
+            actions=list(decision.actions),
+        )
+
+        emit("agent_step", complaint_id=cid, step="act", status="running")
         resolution = node_act(leak, facts, decision, profile)
+        emit(
+            "action_taken",
+            complaint_id=cid,
+            source=complaint.source,
+            author=complaint.author_email,
+            what_broke=facts.what_broke,
+            category=facts.category,
+            decision=resolution.decision,
+            actions=list(resolution.actions_taken),
+            ticket_id=resolution.ticket_created_id,
+            ticket_url=resolution.ticket_url,
+            fix_attempted=resolution.fix_attempted,
+            fix_pr_url=resolution.fix_pr_url,
+            reply_sent=resolution.reply_sent,
+            reply_channel=resolution.reply_channel,
+            escalated=resolution.escalated,
+            dry_run=resolution.dry_run,
+        )
+        emit("agent_step", complaint_id=cid, step="act", status="done", detail=resolution.decision)
+
+        emit("agent_step", complaint_id=cid, step="memory_write", status="running")
         resolution.memory = recalled.to_dict()
         resolution.memory_write_id = node_memory_write(
             complaint, facts, decision, resolution, self.grounding
+        )
+        emit(
+            "agent_step",
+            complaint_id=cid,
+            step="memory_write",
+            status="done",
+            detail="episodic memory written",
         )
         return resolution
 
@@ -283,14 +346,35 @@ class GhostThread:
         )
         now = now or time.time()
 
+        emit(
+            "run_started",
+            scope=scope,
+            live=only_complaint_id is not None,
+            complaint_id=only_complaint_id,
+        )
+
         self.load(now)
 
         pool = self.complaints
         if only_complaint_id:
             pool = [c for c in pool if c.id == only_complaint_id]
 
+        emit("sources_loaded", counts={k: v for k, v in self.loaded_counts.items() if k in scope})
+
         # N2, fanned out across every complaint at once.
         results = find_leaks(pool, self.grounding, self.identities, profile, scope, now)
+
+        for result in results:
+            if result.verdict == "leaked":
+                emit(
+                    "leak_found",
+                    complaint_id=result.complaint["id"],
+                    source=result.complaint["source"],
+                    author=result.complaint.get("author_email", ""),
+                    text=result.complaint["text"][:160],
+                    confidence=result.confidence,
+                    age_hours=result.age_hours,
+                )
 
         missing = [s for s in ALL_SOURCES if s not in scope]
         for result in results:
@@ -317,7 +401,7 @@ class GhostThread:
                 self.action_log.record(complaint.id, resolution)
                 actions.append(resolution.to_dict())
 
-        return RunReport(
+        report = RunReport(
             question=QUESTION,
             sources_requested=scope,
             sources_loaded={k: v for k, v in self.loaded_counts.items() if k in scope},
@@ -337,3 +421,11 @@ class GhostThread:
             stubs=self.stubs(),
             policy_problems=router.validate_policy(profile),
         )
+        emit(
+            "run_complete",
+            summary=report.summary,
+            actions=len(actions),
+            elapsed_ms=report.elapsed_ms,
+            live=only_complaint_id is not None,
+        )
+        return report

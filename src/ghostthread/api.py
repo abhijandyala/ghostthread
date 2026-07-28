@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 import uuid
 from pathlib import Path
@@ -9,11 +11,13 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import config
 from .contracts import ComplaintEvent
+from .events import events_since, last_seq
 from .intent import get_profile, push_profile
 from .killshot import DEFAULT_SCOPES, run_killshot
 from .pipeline import GhostThread
@@ -27,7 +31,7 @@ app.add_middleware(
 )
 
 engine = GhostThread()
-WEB_DIR = Path(__file__).resolve().parents[2] / "web"
+UI_DIST = Path(__file__).resolve().parents[2] / "ui" / "dist"
 
 
 class RunRequest(BaseModel):
@@ -40,6 +44,7 @@ class ComplaintRequest(BaseModel):
     source: str = "slack"
     author_email: str = "judge@frontiertower.dev"
     channel_or_thread: str = "#live-demo"
+    sources: Optional[list[str]] = None
 
 
 class KillshotRequest(BaseModel):
@@ -52,6 +57,7 @@ def health() -> dict[str, Any]:
     return {
         "ok": True,
         "capabilities": config.capability_report(),
+        "last_seq": last_seq(),
         "backends": {
             "grounding": engine.grounding.backend,
             "extraction": engine.extractor.backend,
@@ -86,7 +92,7 @@ def complaint(req: ComplaintRequest) -> dict[str, Any]:
         author_email=req.author_email,
     )
     engine.add_complaint(event)
-    report = engine.run(act_on_leaks=True, only_complaint_id=event.id)
+    report = engine.run(sources=req.sources, act_on_leaks=True, only_complaint_id=event.id)
     return report.to_dict()
 
 
@@ -107,6 +113,35 @@ def reload_corpus() -> dict[str, Any]:
     return {"loaded": engine.load(force=True)}
 
 
-@app.get("/")
-def index() -> FileResponse:
-    return FileResponse(WEB_DIR / "index.html")
+@app.get("/events")
+async def events(since: int = 0) -> StreamingResponse:
+    """SSE stream of pipeline events. The dashboard subscribes on load and
+    renders sub-agents spawning / actions landing as they happen."""
+
+    async def stream():
+        last = since
+        idle_s = 0.0
+        while True:
+            batch = events_since(last)
+            if batch:
+                last = batch[-1]["seq"]
+                for event in batch:
+                    yield f"data: {json.dumps(event)}\n\n"
+                idle_s = 0.0
+            else:
+                idle_s += 0.2
+                if idle_s >= 15.0:
+                    yield ": keepalive\n\n"
+                    idle_s = 0.0
+            await asyncio.sleep(0.2)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# The built React dashboard (ghostthread/ui). Mounted last so API routes win.
+if UI_DIST.exists():
+    app.mount("/", StaticFiles(directory=UI_DIST, html=True), name="ui")
