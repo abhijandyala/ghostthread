@@ -41,10 +41,10 @@
       "id": "llm_1",
       "provider": "llm_anthropic",
       "name": "Agent planner",
-      "description": "The agent's planning and synthesis model. Required: agent_rocketride declares invoke.llm with min 1, max 1. The key resolves from the RocketRide account environment, never from this file.",
+      "description": "The agent's planning and synthesis model. Required: agent_rocketride declares invoke.llm with min 1, max 1. The key resolves from the RocketRide account environment, never from this file. Profile is claude-opus-4-7 because the engine's agent LLM path cannot consume every Anthropic profile: measured against the live server, claude-sonnet-4-6, claude-sonnet-4-5, claude-opus-4-6 and claude-opus-4-5 all return content as a list of blocks, and /opt/rocketride/ai/common/util.py:43 calls .strip() on it -- every run dies with \"LLM error: Exception: 'list' object has no attribute 'strip'\". Only claude-opus-4-7 and claude-haiku-4-5 return a plain string. opus-4-7 is the stronger of the two and this agent has to drive multi-step tool calls; claude-haiku-4-5 is the drop-in fallback if opus is unavailable.",
       "config": {
-        "profile": "claude-sonnet-4-6",
-        "claude-sonnet-4-6": {
+        "profile": "claude-opus-4-7",
+        "claude-opus-4-7": {
           "apikey": "${ROCKETRIDE_ANTHROPIC_KEY}"
         }
       },
