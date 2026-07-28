@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+sandbox_repo/
+.DS_Store
+.rocketride/

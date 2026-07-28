@@ -1,0 +1,205 @@
+{
+  "_comment": "Raw source events for the Northwind demo tenant. Timestamps are offsets in hours before 'now' so the corpus never goes stale. This file is DATA, not answers - no verdicts, no leak flags, no scores. Swap this file for any other corpus and the pipeline recomputes from scratch.",
+  "identities": [
+    {"email": "sarah@acme.com", "slack": "U_SARAH", "github": "sarah-k", "display": "Sarah Kim"},
+    {"email": "dev@bolt.io", "slack": "U_BOLTDEV", "github": "boltdev", "display": "Bolt Dev"},
+    {"email": "maya@lumen.co", "slack": "U_MAYA", "github": null, "display": "Maya Ortiz"},
+    {"email": "priya@zenith.dev", "slack": "U_PRIYA", "github": "priyaz", "display": "Priya Raman"},
+    {"email": "arun@vertex.ai", "slack": "U_ARUN", "github": "arunv", "display": "Arun Patel"},
+    {"email": "lena@harbor.app", "slack": "U_LENA", "github": null, "display": "Lena Fischer"},
+    {"email": "tom@acme.com", "slack": "U_TOM", "github": "tomacme", "display": "Tom Alvarez"},
+    {"email": "ops@northwind.io", "slack": "U_OPS", "github": "northwind-ops", "display": "Northwind Ops"}
+  ],
+  "complaints": [
+    {
+      "id": "slack-1711",
+      "source": "slack",
+      "entity_id": "U_SARAH",
+      "author_email": "sarah@acme.com",
+      "channel_or_thread": "#support-escalations",
+      "t_offset_hours": 190,
+      "text": "CSV export just times out for us on anything over about 10k rows. Spins for 60s then 504s. This is blocking our weekly reporting."
+    },
+    {
+      "id": "slack-1729",
+      "source": "slack",
+      "entity_id": "U_BOLTDEV",
+      "author_email": "dev@bolt.io",
+      "channel_or_thread": "#support-escalations",
+      "t_offset_hours": 176,
+      "text": "Heads up, your webhook retry logic is firing the same delivery twice. We got duplicate charge events on two customers last night. Idempotency key looks like it is being regenerated per attempt."
+    },
+    {
+      "id": "slack-1744",
+      "source": "slack",
+      "entity_id": "U_MAYA",
+      "author_email": "maya@lumen.co",
+      "channel_or_thread": "#support-escalations",
+      "t_offset_hours": 154,
+      "text": "SSO is redirect looping for our Okta tenant. Users bounce between the IdP and your login page until the browser gives up. Started sometime yesterday."
+    },
+    {
+      "id": "slack-1751",
+      "source": "slack",
+      "entity_id": "U_TOM",
+      "author_email": "tom@acme.com",
+      "channel_or_thread": "#dev-feedback",
+      "t_offset_hours": 141,
+      "text": "Small one: the docs code sample for /v2/search passes `query_string` but the API actually expects `q`. Copy pasting it 400s immediately. Tripped up two people on my team."
+    },
+    {
+      "id": "slack-1768",
+      "source": "slack",
+      "entity_id": "U_PRIYA",
+      "author_email": "priya@zenith.dev",
+      "channel_or_thread": "#api-users",
+      "t_offset_hours": 122,
+      "text": "You are returning 429s with no Retry-After or X-RateLimit-Remaining headers, so we cannot back off intelligently. We are just guessing at sleep intervals right now."
+    },
+    {
+      "id": "slack-1783",
+      "source": "slack",
+      "entity_id": "U_SARAH",
+      "author_email": "sarah@acme.com",
+      "channel_or_thread": "#support-escalations",
+      "t_offset_hours": 98,
+      "text": "Dashboard charts render completely blank on Safari 17. Console shows a ResizeObserver loop error. Chrome is fine. Three of our execs are on Safari so this is visible internally."
+    },
+    {
+      "id": "slack-1795",
+      "source": "slack",
+      "entity_id": "U_OPS",
+      "author_email": "ops@northwind.io",
+      "channel_or_thread": "#eng-internal",
+      "t_offset_hours": 87,
+      "text": "Staging deploys have been flaky all week, roughly one in three fails on the migration step and needs a manual rerun."
+    },
+    {
+      "id": "gmail-4402",
+      "source": "gmail",
+      "entity_id": "maya@lumen.co",
+      "author_email": "maya@lumen.co",
+      "channel_or_thread": "thread-4402",
+      "t_offset_hours": 167,
+      "text": "Subject: Invoice tax region incorrect. Our March invoice PDF lists us under EU VAT but Lumen is registered in the UK post-Brexit. Finance cannot process this. Can someone correct the tax region on the account and reissue?"
+    },
+    {
+      "id": "gmail-4418",
+      "source": "gmail",
+      "entity_id": "dev@bolt.io",
+      "author_email": "dev@bolt.io",
+      "channel_or_thread": "thread-4418",
+      "t_offset_hours": 149,
+      "text": "Subject: API key rotation has no grace period. When we rotate a key the old one is revoked instantly, which means every in-flight request fails until we finish redeploying. Every other vendor we use gives a 24h overlap window."
+    },
+    {
+      "id": "gmail-4431",
+      "source": "gmail",
+      "entity_id": "arun@vertex.ai",
+      "author_email": "arun@vertex.ai",
+      "channel_or_thread": "thread-4431",
+      "t_offset_hours": 130,
+      "text": "Subject: SDK will not install on Python 3.12. pip install fails resolving your pydantic pin, you require <2.5 and 3.12 wheels need newer. We are stuck on 3.11 because of this."
+    },
+    {
+      "id": "gmail-4455",
+      "source": "gmail",
+      "entity_id": "priya@zenith.dev",
+      "author_email": "priya@zenith.dev",
+      "channel_or_thread": "thread-4455",
+      "t_offset_hours": 76,
+      "text": "Subject: Scheduled reports arriving an hour early. Our 09:00 digest has been landing at 08:00 since the clocks changed. Looks like the scheduler is using a fixed UTC offset rather than a timezone, so it drifts with DST."
+    },
+    {
+      "id": "gmail-4470",
+      "source": "gmail",
+      "entity_id": "lena@harbor.app",
+      "author_email": "lena@harbor.app",
+      "channel_or_thread": "thread-4470",
+      "t_offset_hours": 54,
+      "text": "Subject: Bulk import silently dropping records. We uploaded 8,400 contacts and 212 never appeared, with no error anywhere in the response or the import log. Every missing one has a non-ASCII character in the name field. Silent data loss is a serious problem for us."
+    }
+  ],
+  "work": [
+    {
+      "id": "NW-412",
+      "source": "linear",
+      "entity_id": "NW-412",
+      "reporter_email": "sarah@acme.com",
+      "t_offset_hours": 182,
+      "status": "In Progress",
+      "title": "CSV export times out above ~10k rows",
+      "description": "Reported by Sarah Kim (Acme) in #support-escalations. Export endpoint hits the 60s gateway timeout for large row counts. Needs streaming response or async job handoff."
+    },
+    {
+      "id": "NW-418",
+      "source": "linear",
+      "entity_id": "NW-418",
+      "reporter_email": "ops@northwind.io",
+      "t_offset_hours": 80,
+      "status": "Todo",
+      "title": "Staging deploy migration step is flaky",
+      "description": "Intermittent failure on the migration step of staging deploys, roughly 30% of runs. Suspect a race between the migration job and readiness probe."
+    },
+    {
+      "id": "NW-421",
+      "source": "linear",
+      "entity_id": "NW-421",
+      "reporter_email": "dev@bolt.io",
+      "t_offset_hours": 140,
+      "status": "In Progress",
+      "title": "Add grace period to API key rotation",
+      "description": "Customer request via email from Bolt. Rotating a key revokes the previous key immediately. Introduce a configurable overlap window, default 24h, before the old key stops working."
+    },
+    {
+      "id": "NW-405",
+      "source": "linear",
+      "entity_id": "NW-405",
+      "reporter_email": "ops@northwind.io",
+      "t_offset_hours": 400,
+      "status": "Done",
+      "title": "Upgrade Postgres to 16",
+      "description": "Routine infrastructure upgrade of the primary cluster. Unrelated to customer reports."
+    },
+    {
+      "id": "gh-233",
+      "source": "github",
+      "entity_id": "233",
+      "reporter_email": "dev@bolt.io",
+      "t_offset_hours": 168,
+      "status": "merged",
+      "title": "fix(webhooks): stable idempotency key across retry attempts",
+      "description": "The delivery worker regenerated the idempotency key on each retry, so downstream consumers saw duplicate events. Key is now derived from the delivery id. Reported by @boltdev after duplicate charge events."
+    },
+    {
+      "id": "gh-241",
+      "source": "github",
+      "entity_id": "241",
+      "reporter_email": "priya@zenith.dev",
+      "t_offset_hours": 118,
+      "status": "open",
+      "title": "Emit Retry-After and X-RateLimit-* headers on 429 responses",
+      "description": "Clients cannot implement intelligent backoff because throttled responses carry no rate limit metadata. Raised by @priyaz. Add Retry-After, X-RateLimit-Limit and X-RateLimit-Remaining to the throttling middleware."
+    },
+    {
+      "id": "gh-250",
+      "source": "github",
+      "entity_id": "250",
+      "reporter_email": "arun@vertex.ai",
+      "t_offset_hours": 126,
+      "status": "merged",
+      "title": "chore(sdk): relax pydantic pin to support Python 3.12",
+      "description": "The <2.5 pydantic constraint blocked installation on Python 3.12. Widened the range and added 3.12 to the test matrix. Raised over email by @arunv at Vertex."
+    },
+    {
+      "id": "gh-228",
+      "source": "github",
+      "entity_id": "228",
+      "reporter_email": "northwind-ops@northwind.io",
+      "t_offset_hours": 420,
+      "status": "merged",
+      "title": "ci: cache uv downloads between jobs",
+      "description": "Build time optimisation for the CI pipeline. No customer impact."
+    }
+  ]
+}

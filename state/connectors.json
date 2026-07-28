@@ -1,0 +1,35 @@
+{
+  "slack": {
+    "provider": "slack",
+    "connector_id": "aeb91475-99a8-44f3-95f1-bee9617624c8",
+    "provider_account_scope": "testteam-slack",
+    "sub_tenant_id": "slack",
+    "resources_total": 3,
+    "documents": 2,
+    "last_successful_sync_at": "2026-07-28T17:10:05Z",
+    "last_error": null,
+    "status": "ready"
+  },
+  "github": {
+    "provider": "github",
+    "connector_id": "b8298556-c866-4e97-9d69-8c5a867d3d77",
+    "provider_account_scope": "testteam-github",
+    "sub_tenant_id": "github",
+    "resources_total": 1,
+    "documents": 0,
+    "last_successful_sync_at": "2026-07-28T17:10:15Z",
+    "last_error": null,
+    "status": "ready"
+  },
+  "linear": {
+    "provider": "linear",
+    "connector_id": "6f4e2604-add5-40b6-9565-47d5cefdfd28",
+    "provider_account_scope": "testteam-linear",
+    "sub_tenant_id": "linear",
+    "resources_total": 1,
+    "documents": 4,
+    "last_successful_sync_at": "2026-07-28T17:10:22Z",
+    "last_error": null,
+    "status": "ready"
+  }
+}

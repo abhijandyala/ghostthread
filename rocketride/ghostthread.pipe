@@ -1,0 +1,74 @@
+{
+  "components": [
+    {
+      "id": "webhook_1",
+      "provider": "webhook",
+      "config": {
+        "hideForm": true,
+        "mode": "Source",
+        "parameters": {},
+        "type": "webhook"
+      }
+    },
+    {
+      "id": "agent_1",
+      "provider": "agent_rocketride",
+      "config": {
+        "type": "agent_rocketride",
+        "parameters": {
+          "system": "You are GhostThread's operator. Given an inbound trigger, call the ghostthread_run tool to detect complaints that never became tracked work, then call ghostthread_killshot to measure how the answer degrades when sources are removed. Return both results verbatim."
+        }
+      },
+      "input": [
+        { "lane": "text", "from": "webhook_1" }
+      ]
+    },
+    {
+      "id": "tool_run",
+      "provider": "tool_http_request",
+      "config": {
+        "type": "tool_http_request",
+        "parameters": {
+          "name": "ghostthread_run",
+          "description": "Detect complaints in Slack and Gmail with no matching Linear or GitHub work, and act on them.",
+          "method": "POST",
+          "url": "${ROCKETRIDE_GHOSTTHREAD_URL}/run",
+          "headers": { "Content-Type": "application/json" },
+          "body": "{\"sources\": null, \"act\": true}"
+        }
+      },
+      "control": [
+        { "classType": "tool", "from": "agent_1" }
+      ]
+    },
+    {
+      "id": "tool_killshot",
+      "provider": "tool_http_request",
+      "config": {
+        "type": "tool_http_request",
+        "parameters": {
+          "name": "ghostthread_killshot",
+          "description": "Re-run the same question against progressively fewer connectors and report the degradation.",
+          "method": "POST",
+          "url": "${ROCKETRIDE_GHOSTTHREAD_URL}/killshot",
+          "headers": { "Content-Type": "application/json" },
+          "body": "{}"
+        }
+      },
+      "control": [
+        { "classType": "tool", "from": "agent_1" }
+      ]
+    },
+    {
+      "id": "response_1",
+      "provider": "response_text",
+      "config": { "laneName": "text" },
+      "input": [
+        { "lane": "text", "from": "agent_1" }
+      ]
+    }
+  ],
+  "project_id": "9f2c4d18-6b03-4a7e-9c51-2ad8f0e7b431",
+  "viewport": { "x": 0, "y": 0, "zoom": 1 },
+  "version": 1
+}
