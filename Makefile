@@ -1,7 +1,13 @@
 # Windows venvs put the interpreter in Scripts/, POSIX ones in bin/. Detect
 # rather than picking one, because this repo gets built on both.
-PY := $(shell if [ -x .venv/Scripts/python.exe ]; then echo .venv/Scripts/python.exe; else echo .venv/bin/python; fi)
-UVICORN := $(shell if [ -x .venv/Scripts/uvicorn.exe ]; then echo .venv/Scripts/uvicorn.exe; else echo .venv/bin/uvicorn; fi)
+#
+# `=` and not `:=`: immediate expansion runs the detection when the Makefile is
+# parsed, which is before the `venv` target has created anything, so `make venv
+# smoke` resolves the interpreter against a directory that does not exist yet
+# and every later target uses the wrong path. Lazy expansion re-runs the check
+# at each use, after the venv exists.
+PY = $(shell if [ -x .venv/Scripts/python.exe ]; then echo .venv/Scripts/python.exe; else echo .venv/bin/python; fi)
+UVICORN = $(shell if [ -x .venv/Scripts/uvicorn.exe ]; then echo .venv/Scripts/uvicorn.exe; else echo .venv/bin/uvicorn; fi)
 export PYTHONPATH := src
 
 .PHONY: demo verify killshot run seed test smoke demo-ready venv

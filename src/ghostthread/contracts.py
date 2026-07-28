@@ -19,7 +19,7 @@ the previous version still constructs.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, get_args
 
 Source = Literal["slack", "gmail", "linear", "github"]
 COMPLAINT_SOURCES: tuple[str, ...] = ("slack", "gmail")
@@ -50,21 +50,10 @@ Category = Literal[
     "internal_notice",
     "unclear",
 ]
-CATEGORIES: tuple[str, ...] = (
-    "genuine_bug",
-    "user_error",
-    "question",
-    "feature_request",
-    "feedback_positive",
-    "feedback_negative",
-    "duplicate_or_known_issue",
-    "security_concern",
-    "billing_or_account",
-    "outage_or_urgent",
-    "spam_or_unrelated",
-    "internal_notice",
-    "unclear",
-)
+# Derived, not repeated. A second hand-written copy of the taxonomy is a copy
+# that eventually disagrees with the type, and the disagreement would show up as
+# a category that type-checks but is never validated against the policy.
+CATEGORIES: tuple[str, ...] = get_args(Category)
 
 # The catch-all a low-confidence classification collapses to. Named once, here,
 # so the router can reference it without a bare string literal.
@@ -458,8 +447,16 @@ class IntentProfile(_JsonMixin):
         return [c for c in CATEGORIES if c not in self.category_policy]
 
     def severity_band(self, severity: float) -> str:
-        """Render a severity float as a word, using bands from the profile."""
-        for label, ceiling in sorted(self.severity_bands.items(), key=lambda kv: kv[1]):
+        """Render a severity float as a word, using bands from the profile.
+
+        Anything over every ceiling belongs to the top band the profile defines,
+        whatever that band happens to be called. Naming the terminal band in code
+        would put one band label outside the document that owns the rest of them.
+        """
+        bands = sorted(self.severity_bands.items(), key=lambda kv: kv[1])
+        for label, ceiling in bands:
             if severity <= ceiling:
                 return label
-        return "high"
+        if bands:
+            return bands[-1][0]
+        return "unknown"  # no bands configured: say so rather than invent one
