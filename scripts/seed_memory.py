@@ -131,11 +131,22 @@ def _days_ago_iso(days: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
 
 
-def load_topics(path: Path) -> list[Topic]:
+def load_topics(path: Path, actor_override: Optional[str] = None) -> list[Topic]:
+    """Episodes from the fixture, optionally re-keyed to a different address.
+
+    The actor is the metadata key `memory_read` filters on, and it has to match
+    the address the live complaint actually arrives with, exactly. Which address
+    that is depends on how the complaint is delivered - a Slack message resolves
+    to the poster's workspace address, an email to whatever account sent it - and
+    that is not known until the demo is set up. `--actor` re-keys every episode
+    so the fixture does not have to be edited, and a wrong guess baked into the
+    file is the worst option: it reads back as zero prior contacts, which is a
+    legitimate answer and therefore fails silently.
+    """
     raw = json.loads(path.read_text())
     topics: list[Topic] = []
     for actor_row in raw.get("actors", []):
-        actor = str(actor_row["actor"])
+        actor = actor_override or str(actor_row["actor"])
         display = str(actor_row.get("display_name") or "")
         for topic_row in actor_row.get("topics", []):
             topics.append(Topic(actor, display, topic_row))
@@ -322,6 +333,13 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="print payloads, write nothing")
     parser.add_argument("--force", action="store_true", help="write for real, overriding DRY_RUN")
     parser.add_argument("--purge", action="store_true", help="delete the seeded memories and exit")
+    parser.add_argument(
+        "--actor",
+        help=(
+            "re-key every episode to this address. Must match the author_email the "
+            "live complaint arrives with, or the memory reads back as zero prior contacts"
+        ),
+    )
     parser.add_argument("--fixture", default=str(SEED_PATH), help="path to the seed fixture")
     args = parser.parse_args()
 
@@ -329,7 +347,7 @@ def main() -> int:
     if not path.exists():
         print(f"no seed fixture at {path}")
         return 2
-    topics = load_topics(path)
+    topics = load_topics(path, actor_override=args.actor)
     episodes = [e for t in topics for e in t.episodes]
     print(f"{path.relative_to(ROOT) if path.is_absolute() else path}: "
           f"{len(episodes)} episode(s) across {len(topics)} topic(s)")

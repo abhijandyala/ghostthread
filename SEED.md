@@ -62,6 +62,22 @@ history rather than open work. `scripts/seed_memory.py` writes them through the
 same `memory_write` path the pipeline uses — no special-casing, no fabricated
 counts, just prior resolutions that genuinely happened.
 
+> **Set the actor before you seed.** `memory_read` filters on the sender address
+> exactly, so the seeded actor must equal the `author_email` the live contact 3
+> arrives with — otherwise it reads back as zero prior contacts, which is a
+> legitimate answer and so fails with no error at all.
+>
+> The plan is to send contact 3 by email from a second Gmail account, so seed
+> with that account's address:
+>
+> ```bash
+> .venv/bin/python scripts/seed_memory.py --force --actor you@second-account.com
+> ```
+>
+> For reference, measured against the live tenant: a Slack message posted from
+> this workspace resolves to `abhijandyala@gmail.com`, and the fixture default is
+> `ops@northbeam.io`, which matches neither. Pick one and be consistent.
+
 Contact 3 is the message you post live. When it lands, GhostThread should report
 `times_reported_by_actor: 3`, tone `escalation`, and name the two prior tickets.
 
