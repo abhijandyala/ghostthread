@@ -12,9 +12,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+import httpx
+
 from . import config
 from .contracts import ComplaintEvent
-from .intent import get_profile, push_profile
+from .intent import get_profile, policy_transport, push_profile
 from .killshot import DEFAULT_SCOPES, run_killshot
 from .pipeline import GhostThread
 from .router import validate_policy
@@ -69,7 +71,43 @@ def health() -> dict[str, Any]:
         "stubs": engine.stubs(),
         "policy_problems": validate_policy(profile),
         "idempotency": engine.action_log.status(),
+        # Which of N4's three read paths actually answered. `backends
+        # .intent_profile` says whether the policy is live; this says how it got
+        # here, so "served by the edge function" is checkable rather than
+        # asserted.
+        "policy_transport": policy_transport(),
     }
+
+
+@app.get("/memory_dashboard")
+def memory_dashboard(limit: int = 500, min_times: int = 1, actor: Optional[str] = None) -> dict[str, Any]:
+    """Proxy for the `memory-dashboard` InsForge edge function.
+
+    A pass-through, not a reimplementation. The aggregation lives in the edge
+    function so the number on the screen is the number InsForge computed; if
+    this endpoint recomputed it locally the dashboard could disagree with its
+    own source and nobody would know which one was right.
+    """
+    if not (config.INSFORGE_BASE_URL and config.INSFORGE_DASHBOARD_FUNCTION):
+        raise HTTPException(
+            503,
+            "the memory dashboard is served by an InsForge edge function and "
+            "INSFORGE_BASE_URL is not configured",
+        )
+    url = f"{config.INSFORGE_BASE_URL.rstrip('/')}/functions/{config.INSFORGE_DASHBOARD_FUNCTION}"
+    params: dict[str, Any] = {"limit": limit, "min_times": min_times}
+    if actor:
+        params["actor"] = actor
+    try:
+        resp = httpx.get(url, params=params, timeout=config.INSFORGE_FUNCTION_TIMEOUT * 4)
+    except Exception as exc:
+        raise HTTPException(502, f"memory-dashboard edge function unreachable: {type(exc).__name__}")
+    if not resp.is_success:
+        # Passed through verbatim. The function distinguishes "table missing"
+        # from "no complaints yet", and flattening that here would throw away
+        # the only signal that separates a broken deploy from a quiet day.
+        raise HTTPException(resp.status_code, resp.text[:500])
+    return resp.json()
 
 
 @app.post("/run")

@@ -53,6 +53,16 @@ INSFORGE_ACTIONS_TABLE = os.getenv("INSFORGE_ACTIONS_TABLE", "actions_log")
 # flag exists to prevent. Set false to require scripts/seed_insforge.py instead.
 INSFORGE_AUTO_PROVISION = _flag("INSFORGE_AUTO_PROVISION", default=True)
 INTENT_PROFILE_TTL_SECONDS = float(os.getenv("INTENT_PROFILE_TTL_SECONDS", "5"))
+# Edge functions. `policy-read` is pipeline node N4's transport as the PRD
+# specifies it: the policy is served over a public endpoint so a caller does not
+# need the admin credential. Set INSFORGE_POLICY_FUNCTION empty to read the table
+# directly instead -- same document, one fewer hop. Both are labelled `insforge`
+# because both are InsForge; `intent.policy_transport()` says which one answered.
+INSFORGE_POLICY_FUNCTION = os.getenv("INSFORGE_POLICY_FUNCTION", "policy-read")
+INSFORGE_DASHBOARD_FUNCTION = os.getenv("INSFORGE_DASHBOARD_FUNCTION", "memory-dashboard")
+# Short on purpose. A cold Deno isolate must cost latency, never the policy: the
+# direct table read is waiting behind it.
+INSFORGE_FUNCTION_TIMEOUT = float(os.getenv("INSFORGE_FUNCTION_TIMEOUT", "4"))
 LOCAL_PROFILE_PATH = Path(
     os.getenv("LOCAL_PROFILE_PATH", REPO_ROOT / "insforge" / "intent_profile.json")
 )
