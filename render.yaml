@@ -1,0 +1,88 @@
+# Render blueprint for the GhostThread service.
+#
+# This is the thing RocketRide calls. RocketRide Cloud owns the public webhook,
+# the agent loop and tool routing; every piece of real work -- HydraDB
+# retrieval, the Anthropic calls, the Linear and GitHub writes -- happens here,
+# because RocketRide's tool_python node blocks `import` and cannot load
+# hydradb-sdk. So this service needs a public URL, and that is what Render
+# provides.
+#
+# Secrets are marked `sync: false`: Render will prompt for them on first deploy
+# and store them encrypted rather than reading them from this file. Nothing
+# secret belongs in a committed blueprint.
+
+services:
+  - type: web
+    name: ghostthread
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+
+    buildCommand: pip install -r requirements.txt
+    # `src` layout, so the package is not importable without it on the path.
+    startCommand: PYTHONPATH=src uvicorn ghostthread.api:app --host 0.0.0.0 --port $PORT
+
+    # /health is cheap: it reads the capability report and the cached profile
+    # and touches no connector, so it will not wake the whole pipeline.
+    healthCheckPath: /health
+
+    envVars:
+      # --- runtime ---------------------------------------------------------
+      - key: PYTHON_VERSION
+        value: "3.12.10"
+      - key: PYTHONPATH
+        value: src
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      # --- safety ----------------------------------------------------------
+      # Default ON. Tickets, patches and replies are computed and returned but
+      # not sent. Flip this to false in the Render dashboard only when you
+      # intend the service to write to the outside world.
+      - key: DRY_RUN
+        value: "true"
+
+      # --- HydraDB: grounding + episodic memory ----------------------------
+      - key: HYDRA_TOKEN
+        sync: false
+      - key: HYDRA_DATABASE
+        sync: false
+      - key: HYDRA_TENANT_ID
+        sync: false
+
+      # --- Anthropic: classification + fix generation ----------------------
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: EXTRACTION_MODEL
+        value: claude-haiku-4-5
+      - key: CODING_AGENT_MODEL
+        value: claude-opus-5
+
+      # --- InsForge: intent profile + idempotency log ----------------------
+      - key: INSFORGE_BASE_URL
+        sync: false
+      - key: INSFORGE_API_KEY
+        sync: false
+
+      # --- read/write connectors -------------------------------------------
+      - key: SLACK_TOKEN
+        sync: false
+      - key: LINEAR_TOKEN
+        sync: false
+      - key: LINEAR_TEAM_ID
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        sync: false
+      - key: GMAIL_ADDRESS
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
