@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,6 +48,9 @@ class ComplaintRequest(BaseModel):
     author_email: str = "judge@frontiertower.dev"
     channel_or_thread: str = "#live-demo"
     sources: Optional[list[str]] = None
+    # The upstream message's own id, when the caller knows it -- Slack's `ts`,
+    # Gmail's message id. Optional so existing callers keep working.
+    external_id: Optional[str] = None
 
 
 class KillshotRequest(BaseModel):
@@ -126,6 +129,36 @@ def killshot(req: KillshotRequest) -> dict[str, Any]:
     return run_killshot(engine, scopes=req.scopes or DEFAULT_SCOPES)
 
 
+def complaint_id(req: ComplaintRequest) -> str:
+    """The idempotency key for an inbound complaint.
+
+    N8 dedupes on `complaint_id` against a UNIQUE constraint, and it is checked
+    before acting. A fresh `uuid4` per call defeats that completely: the same
+    Slack message submitted twice arrives as two different complaints, so the
+    constraint never fires and a second Linear ticket and a second draft PR get
+    filed. The guarantee was real; the key was not.
+
+    A caller that knows the message's own identity passes `external_id` and gets
+    exactly the id the connector would have assigned -- `slack-<ts>` -- so the
+    polled path and the live path are one complaint rather than two.
+
+    With no external id the key is derived from the content rather than
+    invented, so re-typing the same message in the demo box replays the original
+    outcome instead of filing again. Whitespace and case are normalised because
+    a retyped message is the same complaint, not a new one.
+    """
+    if req.external_id and req.external_id.strip():
+        return req.external_id.strip()
+    fingerprint = "\x1f".join(
+        (
+            req.source,
+            req.author_email.strip().lower(),
+            " ".join(req.text.split()).lower(),
+        )
+    )
+    return f"live-{hashlib.sha256(fingerprint.encode('utf-8')).hexdigest()[:12]}"
+
+
 @app.post("/complaint")
 def complaint(req: ComplaintRequest) -> dict[str, Any]:
     """Live-typed complaint. Ingested, then run through the identical pipeline."""
@@ -133,7 +166,7 @@ def complaint(req: ComplaintRequest) -> dict[str, Any]:
         raise HTTPException(400, "source must be slack or gmail")
 
     event = ComplaintEvent(
-        id=f"live-{uuid.uuid4().hex[:8]}",
+        id=complaint_id(req),
         source=req.source,
         entity_id=req.author_email,
         text=req.text.strip(),

@@ -169,6 +169,57 @@ def node_memory_write(
     return memory.memory_write(record, grounding)
 
 
+def node_track_filed_ticket(
+    complaint: ComplaintEvent,
+    facts: ExtractedFacts,
+    resolution: ResolutionAction,
+    grounding: HydraGrounding,
+) -> Optional[str]:
+    """Put the ticket we just filed into the context graph as tracked work.
+
+    Until this ran, the loop never closed. GhostThread filed a Linear ticket and
+    its own retrieval never saw it, so the next report of the same problem --
+    the reporter following up, a colleague wording it differently -- still
+    joined against nothing, still scored as leaked, and got filed again. The
+    duplicate ticket was the symptom; the invisible ticket was the cause.
+
+    Nothing here decides anything. Once the ticket is in the graph it is matched
+    by the same join, against the same `match_threshold` from the intent
+    profile, as work that arrived from the Linear connector. This node only
+    makes the ticket visible; `leaks.py` still owns the verdict.
+
+    A dry run has filed nothing, so there is nothing to make visible and this
+    returns None rather than seeding the graph with work that does not exist.
+    """
+    ticket_id = resolution.ticket_created_id
+    if resolution.dry_run or not ticket_id:
+        return None
+
+    item = WorkEvent(
+        id=f"linear-{ticket_id}",
+        source="linear",
+        entity_id=ticket_id,
+        title=facts.what_broke,
+        # The complaint text, so the next report of the same problem matches on
+        # what was described rather than only on the title we summarised it to.
+        description=complaint.text,
+        t_created=time.time(),
+        status="open",
+        reporter_email=complaint.author_email,
+    )
+
+    try:
+        before = grounding.row_count()
+        grounding.ingest([], [item])
+        grounding.wait_until_indexed(before + 1)
+    except Exception as exc:
+        # A ticket that was filed but not indexed is a real outcome and the
+        # caller is told which one it was. It is not worth failing a resolution
+        # that otherwise succeeded.
+        return f"not-indexed: {type(exc).__name__}"
+    return item.id
+
+
 def node_log(
     complaint_id: str,
     resolution: ResolutionAction,
@@ -203,6 +254,8 @@ class GhostThread:
         self.complaints: list[ComplaintEvent] = []
         self.work: list[WorkEvent] = []
         self.loaded_counts: dict[str, int] = {}
+        # source -> why it could not be read this run. Empty is the healthy state.
+        self.connector_errors: dict[str, str] = {}
         self.action_log = actions_log.ActionsLog()
         self._loaded = False
 
@@ -211,17 +264,31 @@ class GhostThread:
             return self.loaded_counts
         now = now or time.time()
 
-        self.complaints = []
-        for name, fetch in connectors.COMPLAINT_FETCHERS.items():
-            events = fetch(now)
-            self.complaints.extend(events)
-            self.loaded_counts[name] = len(events)
+        # One connector failing must not take the other three with it. A dead
+        # Gmail credential used to raise out of here and 500 the whole run, so
+        # "every integration degrades independently" was true of missing
+        # credentials and false of broken ones. A source that could not be read
+        # loads zero events and says why, which is the same shape as a source
+        # that was never configured.
+        self.connector_errors = {}
 
+        self.complaints = []
         self.work = []
-        for name, fetch in connectors.WORK_FETCHERS.items():
-            events = fetch(now)
-            self.work.extend(events)
-            self.loaded_counts[name] = len(events)
+        for bucket, fetchers in (
+            (self.complaints, connectors.COMPLAINT_FETCHERS),
+            (self.work, connectors.WORK_FETCHERS),
+        ):
+            for name, fetch in fetchers.items():
+                try:
+                    events = fetch(now)
+                except Exception as exc:
+                    reason = f"{type(exc).__name__}: {str(exc)[:160]}"
+                    self.connector_errors[name] = reason
+                    self.loaded_counts[name] = 0
+                    emit("connector_failed", source=name, reason=reason)
+                    continue
+                bucket.extend(events)
+                self.loaded_counts[name] = len(events)
 
         self.identities = IdentityGraph().build(
             self.complaints, self.work, declared=connectors.identities()
@@ -234,10 +301,24 @@ class GhostThread:
     def add_complaint(self, complaint: ComplaintEvent) -> None:
         """Live-typed complaint from a judge. Goes through the identical path."""
         self.load()
+
+        # Replace rather than append. The same complaint arriving twice -- a
+        # watcher restart, a resubmitted demo box -- must be one entry in the
+        # pool, or a scoped run matches it twice and reports the same outcome
+        # once per copy. N8 keeps both copies from filing a ticket; this keeps
+        # them from existing.
+        already_pooled = any(c.id == complaint.id for c in self.complaints)
+        self.complaints = [c for c in self.complaints if c.id != complaint.id]
         self.complaints.append(complaint)
         self.identities = IdentityGraph().build(
             self.complaints, self.work, declared=connectors.identities()
         )
+        if already_pooled:
+            # It is already in the index under this id. Re-ingesting would either
+            # duplicate the document or stall the row-count wait below, which
+            # expects the count to grow by exactly one.
+            return
+
         before = self.grounding.row_count()
         self.grounding.ingest([complaint], [])
         self.grounding.wait_until_indexed(before + 1)
@@ -318,6 +399,21 @@ class GhostThread:
             dry_run=resolution.dry_run,
         )
         emit("agent_step", complaint_id=cid, step="act", status="done", detail=resolution.decision)
+
+        emit("agent_step", complaint_id=cid, step="track_ticket", status="running")
+        tracked_as = node_track_filed_ticket(complaint, facts, resolution, self.grounding)
+        resolution.meta["tracked_work_id"] = tracked_as
+        emit(
+            "agent_step",
+            complaint_id=cid,
+            step="track_ticket",
+            status="done",
+            detail=(
+                f"filed ticket is now tracked work ({tracked_as})"
+                if tracked_as
+                else "nothing filed to track"
+            ),
+        )
 
         emit("agent_step", complaint_id=cid, step="memory_write", status="running")
         resolution.memory_write_id = node_memory_write(

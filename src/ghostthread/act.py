@@ -175,6 +175,165 @@ def allowlist_check(profile: IntentProfile) -> tuple[bool, str]:
     return True, f"{target} is on the sandbox allowlist"
 
 
+def open_pull_request(
+    facts: ExtractedFacts, profile: IntentProfile, ticket_id: Optional[str]
+) -> tuple[bool, Optional[str], dict[str, Any]]:
+    """Propose the fix as a reviewable draft PR on the sandbox repo.
+
+    `attempt_fix` stops at a patch in a local disposable repo, which is the safe
+    default for an unattended pipeline but means the proposal is invisible to
+    the person who has to judge it. This pushes a branch and opens a draft.
+
+    The allowlist still governs which repo may be touched, and the PR is always
+    a draft and never merged -- proposing is not the same as shipping.
+    """
+    import subprocess
+    import tempfile
+
+    permitted, why = allowlist_check(profile)
+    if not permitted:
+        return False, None, {"blocked": why}
+    if config.DRY_RUN:
+        return False, None, {"dry_run": True, "would_target": config.GITHUB_REPO}
+    if not (config.GITHUB_TOKEN and config.GITHUB_REPO and config.ANTHROPIC_API_KEY):
+        return False, None, {"skipped": "GITHUB_TOKEN, GITHUB_REPO or ANTHROPIC_API_KEY missing"}
+
+    def git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+    try:
+        work = Path(tempfile.mkdtemp(prefix="ghostpr-"))
+        clone = work / "repo"
+        auth = f"https://x-access-token:{config.GITHUB_TOKEN}@github.com/{config.GITHUB_REPO}.git"
+        c = git(["clone", "--depth", "1", auth, str(clone)], work)
+        if c.returncode != 0:
+            return False, None, {"error": f"clone failed: {c.stderr[-200:]}"}
+
+        # Show the model the whole source tree, not one guessed file. Guessing
+        # from `file_hint` sent it App.jsx for a bug that lives in Nav.jsx, and
+        # a model asked to fix a file that does not contain the bug can only
+        # refuse or invent. Let it choose the file; it has the evidence.
+        sources = sorted(
+            [p for p in clone.rglob("*") if p.suffix in {".jsx", ".js"} and "node_modules" not in p.parts],
+            key=lambda p: p.stat().st_size,
+        )
+        if not sources:
+            return False, None, {"error": "no source files found in the repo"}
+
+        budget, listing = 120_000, []
+        for p in sources:
+            body = p.read_text(encoding="utf-8", errors="replace")
+            if len(body) > budget:
+                continue
+            budget -= len(body)
+            listing.append(f"----- FILE: {p.relative_to(clone).as_posix()} -----\n{body}")
+
+        prompt = (
+            "You are fixing one small, well-scoped bug in a React codebase.\n\n"
+            f"Reported problem: {facts.what_broke}\n\n"
+            "Here is the source tree:\n\n" + "\n\n".join(listing) + "\n\n"
+            "Reply in EXACTLY this format and nothing else:\n"
+            "FILE: <path of the one file to change>\n"
+            "<the complete corrected contents of that file>\n\n"
+            "No markdown fence. No commentary before or after. Make the smallest "
+            "change that fixes the reported problem and change nothing else.\n"
+            "If no file here contains the bug, reply with exactly: CANNOT_FIX"
+        )
+        mresp = httpx.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": config.ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": config.CODING_AGENT_MODEL,
+                "max_tokens": 8000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=180.0,
+        )
+        mresp.raise_for_status()
+        raw = "".join(b.get("text", "") for b in mresp.json().get("content", [])).strip()
+
+        # The model is allowed to decline, and declining is the correct answer
+        # when the bug is not in front of it. What must never happen is writing
+        # that refusal into a source file and opening a PR on it -- which is
+        # exactly what happened before this check existed.
+        if raw.startswith("CANNOT_FIX") or not raw.startswith("FILE:"):
+            return False, None, {
+                "declined": "model did not return a patch",
+                "said": raw[:300],
+            }
+
+        first, _, body = raw.partition("\n")
+        rel = first[len("FILE:"):].strip().lstrip("./")
+        target = clone / rel
+        if not target.exists():
+            return False, None, {"error": f"model named a file that does not exist: {rel}"}
+
+        original = target.read_text(encoding="utf-8")
+        fixed = body.strip()
+        if fixed.startswith("```"):
+            fixed = "\n".join(fixed.split("\n")[1:])
+            if fixed.rstrip().endswith("```"):
+                fixed = fixed.rstrip()[:-3]
+
+        # Cheap sanity gate. A React source file has imports or exports; prose
+        # explaining why a fix is impossible does not. This is the difference
+        # between a patch and a paragraph.
+        if ("import " not in fixed and "export " not in fixed) or len(fixed) < len(original) // 3:
+            return False, None, {
+                "declined": "response did not look like source code",
+                "said": fixed[:300],
+            }
+
+        if fixed.startswith("```"):
+            fixed = "\n".join(fixed.split("\n")[1:])
+            if fixed.rstrip().endswith("```"):
+                fixed = fixed.rstrip()[:-3]
+        if not fixed.strip() or fixed.strip() == original.strip():
+            return False, None, {"result": "model proposed no change", "file": rel}
+
+        target.write_text(fixed, encoding="utf-8")
+        branch = f"ghostthread/{(ticket_id or facts.complaint_id).lower()}"
+        git(["checkout", "-b", branch], clone)
+        git(["-c", "user.name=GhostThread", "-c", "user.email=ghostthread@testteam.dev",
+             "commit", "-am", f"fix: {facts.what_broke[:64]}"], clone)
+        p = git(["push", "-q", "origin", branch], clone)
+        if p.returncode != 0:
+            return False, None, {"error": f"push failed: {p.stderr[-200:]}"}
+
+        resp = httpx.post(
+            f"https://api.github.com/repos/{config.GITHUB_REPO}/pulls",
+            headers={
+                "Authorization": f"Bearer {config.GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={
+                "title": f"fix: {facts.what_broke[:64]}",
+                "head": branch,
+                "base": "main",
+                "draft": True,
+                "body": (
+                    f"Filed automatically by {TICKET_OWNER} from an untracked customer report.\n\n"
+                    f"**Ticket:** {ticket_id or 'n/a'}\n"
+                    f"**Category:** {facts.category} (confidence {facts.confidence:.2f})\n"
+                    f"**Severity:** {facts.severity:.2f}\n"
+                    f"**File:** `{rel}`\n\n{facts.what_broke}\n\n"
+                    "---\nDraft. Never auto-merged."
+                ),
+            },
+            timeout=60.0,
+        )
+        if resp.status_code >= 300:
+            return False, None, {"error": f"github {resp.status_code}: {resp.text[:200]}", "branch": branch}
+        url = resp.json().get("html_url")
+        return True, url, {"url": url, "branch": branch, "file": rel, "allowlist": why}
+    except Exception as exc:
+        return False, None, {"error": str(exc)[:250]}
+
+
 def _fix_confidence_threshold(profile: IntentProfile) -> float:
     """The line between "ready for review" and "a human must read this first".
 
@@ -423,11 +582,22 @@ def resolve(
 
     ticket_id: Optional[str] = None
     ticket_url: Optional[str] = None
+    pr_url: Optional[str] = None
     if permitted & TICKET_ACTIONS:
         ticket_id, ticket_meta = create_ticket(leak, facts, profile, decision, memory)
         ticket_url = ticket_meta.get("url")
         meta["ticket"] = ticket_meta
         performed.extend(sorted(permitted & TICKET_ACTIONS))
+
+        # Every filed ticket gets a proposed fix on the sandbox repo. The
+        # severity gate below still governs the *local* patch path; this is the
+        # visible half -- a reviewable draft PR next to the ticket, so the
+        # ticket is never the end of the story.
+        pr_ok, pr_link, pr_meta = open_pull_request(facts, profile, ticket_id)
+        meta["pull_request"] = pr_meta
+        if pr_ok and pr_link:
+            pr_url = pr_link
+            performed.append("open_pull_request")
 
     if LINK_ACTION in permitted:
         meta["link"] = {
@@ -477,7 +647,7 @@ def resolve(
         ticket_created_id=ticket_id,
         ticket_url=ticket_url,
         fix_attempted=fix_attempted,
-        fix_pr_url=fix_url,
+        fix_pr_url=fix_url or pr_url,
         pr_confidence=pr_confidence,
         reply_sent=reply_sent,
         reply_channel=reply_channel,
