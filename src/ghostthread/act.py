@@ -248,13 +248,20 @@ def open_pull_request(
             },
             json={
                 "model": config.CODING_AGENT_MODEL,
-                "max_tokens": 8000,
+                # The model has to emit a whole corrected file, so the ceiling is
+                # sized for the file plus the reasoning it takes to find the bug.
+                # At 8000 a subtle fault in a 200-line component exhausted the
+                # budget before a single character of the patch was written, and
+                # the run reported "model did not return a patch" quoting nothing
+                # at all -- indistinguishable from a refusal.
+                "max_tokens": 32000,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=180.0,
         )
         mresp.raise_for_status()
-        raw = "".join(b.get("text", "") for b in mresp.json().get("content", [])).strip()
+        body = mresp.json()
+        raw = "".join(b.get("text", "") for b in body.get("content", [])).strip()
 
         # The model is allowed to decline, and declining is the correct answer
         # when the bug is not in front of it. What must never happen is writing
@@ -264,6 +271,10 @@ def open_pull_request(
             return False, None, {
                 "declined": "model did not return a patch",
                 "said": raw[:300],
+                # Without this, a refusal and a truncated response are the same
+                # empty string. `max_tokens` here means the budget ran out, not
+                # that the model had nothing to say.
+                "stop_reason": body.get("stop_reason"),
             }
 
         first, _, body = raw.partition("\n")
@@ -304,6 +315,13 @@ def open_pull_request(
         if p.returncode != 0:
             return False, None, {"error": f"push failed: {p.stderr[-200:]}"}
 
+        # Whether a proposal may ship is policy, not a constant. `never_automerge`
+        # is a field on the InsForge intent profile, so flipping that row turns
+        # this from "propose and wait for a human" into "ship it" with no code
+        # change and no redeploy. A draft cannot be merged, so the flag also
+        # decides whether the PR is opened as a draft in the first place.
+        automerge = not profile.never_automerge
+
         resp = httpx.post(
             f"https://api.github.com/repos/{config.GITHUB_REPO}/pulls",
             headers={
@@ -314,22 +332,61 @@ def open_pull_request(
                 "title": f"fix: {facts.what_broke[:64]}",
                 "head": branch,
                 "base": "main",
-                "draft": True,
+                "draft": not automerge,
                 "body": (
                     f"Filed automatically by {TICKET_OWNER} from an untracked customer report.\n\n"
                     f"**Ticket:** {ticket_id or 'n/a'}\n"
                     f"**Category:** {facts.category} (confidence {facts.confidence:.2f})\n"
                     f"**Severity:** {facts.severity:.2f}\n"
                     f"**File:** `{rel}`\n\n{facts.what_broke}\n\n"
-                    "---\nDraft. Never auto-merged."
+                    + (
+                        "---\nMerged automatically: the intent profile permits it "
+                        "for this repository."
+                        if automerge
+                        else "---\nDraft. Never auto-merged."
+                    )
                 ),
             },
             timeout=60.0,
         )
         if resp.status_code >= 300:
             return False, None, {"error": f"github {resp.status_code}: {resp.text[:200]}", "branch": branch}
-        url = resp.json().get("html_url")
-        return True, url, {"url": url, "branch": branch, "file": rel, "allowlist": why}
+        opened = resp.json()
+        url = opened.get("html_url")
+        meta: dict[str, Any] = {
+            "url": url,
+            "branch": branch,
+            "file": rel,
+            "allowlist": why,
+            "automerge_permitted": automerge,
+            "merged": False,
+        }
+
+        if automerge:
+            merge = httpx.put(
+                f"https://api.github.com/repos/{config.GITHUB_REPO}/pulls/"
+                f"{opened.get('number')}/merge",
+                headers={
+                    "Authorization": f"Bearer {config.GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github+json",
+                },
+                json={
+                    "merge_method": "squash",
+                    "commit_title": f"fix: {facts.what_broke[:64]} (#{opened.get('number')})",
+                },
+                timeout=60.0,
+            )
+            # A merge that did not happen is reported as not having happened.
+            # Branch protection, a conflict and a race all land here, and saying
+            # "merged" because the request was sent would make the deployed site
+            # and this record disagree.
+            meta["merged"] = merge.status_code < 300
+            meta["merge_detail"] = (
+                merge.json().get("message", "") if merge.status_code < 300
+                else f"github {merge.status_code}: {merge.text[:200]}"
+            )
+
+        return True, url, meta
     except Exception as exc:
         return False, None, {"error": str(exc)[:250]}
 
